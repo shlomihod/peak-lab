@@ -1,0 +1,23 @@
+{
+  "name": "peak-lab",
+  "owner": {
+    "name": "shlomihod"
+  },
+  "metadata": {
+    "description": "Garmin Connect training analysis plugin for Claude Code.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "peak-lab",
+      "source": "./",
+      "description": "Claude Code plugin that turns Garmin Connect data into a multi-agent training analysis. Port of leonzzz435/garmin-ai-coach.",
+      "version": "0.2.0",
+      "author": {
+        "name": "shlomihod"
+      },
+      "license": "MIT",
+      "keywords": ["garmin", "training", "coaching", "fitness", "analysis", "running", "cycling"]
+    }
+  ]
+}
