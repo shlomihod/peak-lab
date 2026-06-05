@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""
+training-metrics: deterministic load math for peak-lab.
+
+Reads raw.json (from bin/fetch-garmin) and writes training-metrics.json
+with per-day and per-week rollups. The output is sport-agnostic by
+construction — every activity counts toward total load, with a per-sport
+breakdown alongside totals so the experts can see what came from where.
+
+This exists so the three expert subagents do not each reimplement EWMA
+decay, rolling-sum ACWR, and weekly volume math in fresh inline Python
+every run. One source of truth in, three readers out.
+
+Usage:
+    training-metrics <raw.json> [--out training-metrics.json]
+
+If --out is omitted, the output is written next to raw.json as
+"training-metrics.json".
+
+Output schema (top-level keys):
+    generated_at, window_days, atl_decay_days, ctl_decay_days,
+    load_source, per_day, weekly, totals,
+    sport_composition, sport_shift
+
+Per-day entries (keyed by YYYY-MM-DD, athlete local date):
+    load_total, load_by_sport, duration_min_total,
+    duration_min_by_sport, distance_km_total, distance_km_by_sport,
+    sessions_total, sessions_by_sport,
+    atl, ctl, tsb, acwr_coupled, acwr_uncoupled,
+    ramp_rate_pct, monotony, strain,
+    by_sport (per-sport rolling EWMA — see below)
+
+Per-sport rolling EWMA (per_day[<date>].by_sport[<sport-bucket>]):
+    load   — this calendar day's load from this sport only (0 if no session)
+    ctl    — 42-day EWMA computed on this sport's daily-load series only
+    atl    — 7-day EWMA same series
+    tsb    — ctl - atl
+The math is identical to the multi-sport version (same `ewma()`, same τ values),
+just applied to a per-sport daily-load series. This lets the experts see a
+sport-specific fitness/fatigue view alongside the multi-sport one — useful when
+the athlete is racing in a specific discipline and recent cross-training is
+inflating the combined CTL.
+
+Top-level sport_composition:
+    { "7d": {sport: fraction, ...}, "28d": {...}, "60d": {...} }
+Each fraction is (sport load in window) / (total load in window), rounded to 2dp.
+Sports with zero load in a window are omitted from that window.
+
+Top-level sport_shift:
+    { "shifted": bool, "details": [str, ...] }
+Triggers when any sport's 7d fraction differs from its 28d fraction by more
+than 0.15 in either direction. The 28d baseline catches recent transitions;
+a 60d baseline would dilute a 2-3 week sport block in a longer denominator.
+`details` lists human-readable shift descriptions sorted by absolute
+magnitude descending.
+
+Weekly entries (Monday-start, athlete local date):
+    week_start, week_end, by_sport (km/duration_min/sessions/load),
+    total_sessions, total_duration_min, total_load,
+    total_km (running+cycling combined km for chart back-compat)
+
+stdlib only — no external dependencies.
+
+Banister model constants follow standard literature:
+    ATL = exponentially weighted moving average of daily load, tau=7d
+    CTL = same, tau=42d
+    TSB = CTL - ATL  (positive = freshness, negative = fatigue)
+    ACWR (coupled)   = 7-day rolling-mean load / 28-day rolling-mean load
+    ACWR (uncoupled) = 7-day load / mean of the 21 days preceding that 7-day window
+    Ramp rate %      = (this week's load - last week's) / last week's * 100
+    Monotony         = mean(daily load over 7 days) / stdev(daily load over 7 days)
+    Strain           = weekly load (7-day sum) * monotony
+
+Load source priority per activity:
+    1. activityTrainingLoad (Garmin's sport-agnostic TSS-equivalent)
+    2. aerobicTrainingEffect * duration_min * 1.0
+       + anaerobicTrainingEffect * duration_min * 0.6   (rough fallback)
+    3. duration_min * 0.7  (last-resort floor for sessions with no TE)
+
+The source is reported per activity in totals.load_source_counts so the
+caller can see how much of the data was first-class Garmin load vs.
+estimated.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+# Sport-bucket helpers live alongside this script so the renderer can import
+# the same mapping. Inserting the script's directory at sys.path[0] lets us
+# import a sibling module without packaging gymnastics.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from peak_lab_sports import bucket_for  # noqa: E402
+
+
+ATL_TAU = 7
+CTL_TAU = 42
+
+# CTL with τ=42, seeded from 0, reaches ~95% of steady-state at roughly
+# 3 × τ = 126 days of consistent load. Mark per-day points before this
+# threshold as "ctl_warm: false" so the expert can flag the trend as still
+# saturating rather than reporting a misleadingly-low absolute fitness.
+CTL_WARMUP_DAYS = 3 * CTL_TAU
+
+
+def parse_local_date(act: dict) -> date | None:
+    raw_dt = act.get("startTimeLocal") or act.get("startTimeGMT")
+    if not isinstance(raw_dt, str) or len(raw_dt) < 10:
+        return None
+    try:
+        return date.fromisoformat(raw_dt[:10])
+    except ValueError:
+        return None
+
+
+def load_for(act: dict) -> tuple[float, str]:
+    """Return (load_score, source_tag) for one activity."""
+    tl = act.get("activityTrainingLoad")
+    if isinstance(tl, (int, float)) and tl > 0:
+        return float(tl), "garmin_training_load"
+
+    dur_sec = act.get("duration") or act.get("movingDuration") or 0
+    try:
+        dur_min = float(dur_sec) / 60.0
+    except (TypeError, ValueError):
+        dur_min = 0.0
+
+    aerobic = act.get("aerobicTrainingEffect") or 0
+    anaerobic = act.get("anaerobicTrainingEffect") or 0
+    try:
+        aerobic = float(aerobic)
+        anaerobic = float(anaerobic)
+    except (TypeError, ValueError):
+        aerobic = anaerobic = 0.0
+
+    if (aerobic > 0 or anaerobic > 0) and dur_min > 0:
+        return dur_min * (aerobic * 1.0 + anaerobic * 0.6), "te_weighted_duration"
+
+    if dur_min > 0:
+        return dur_min * 0.7, "duration_only"
+
+    return 0.0, "none"
+
+
+def daterange(start: date, end_inclusive: date):
+    d = start
+    while d <= end_inclusive:
+        yield d
+        d += timedelta(days=1)
+
+
+def ewma(values: list[float], tau: int) -> list[float]:
+    """Banister EWMA seeded from 0 on day 0."""
+    if tau <= 0:
+        return values[:]
+    alpha = 1.0 - math.exp(-1.0 / tau)
+    out = []
+    prev = 0.0
+    for v in values:
+        cur = prev + alpha * (v - prev)
+        out.append(cur)
+        prev = cur
+    return out
+
+
+def rolling_mean(values: list[float], window: int) -> list[float | None]:
+    out: list[float | None] = []
+    for i in range(len(values)):
+        if i + 1 < window:
+            out.append(None)
+            continue
+        out.append(sum(values[i + 1 - window:i + 1]) / window)
+    return out
+
+
+def rolling_sum(values: list[float], window: int) -> list[float | None]:
+    out: list[float | None] = []
+    for i in range(len(values)):
+        if i + 1 < window:
+            out.append(None)
+            continue
+        out.append(sum(values[i + 1 - window:i + 1]))
+    return out
+
+
+def compute(raw: dict) -> dict:
+    acts = raw.get("activities") or []
+    window_days = raw.get("window_days")
+
+    # Pass 1: aggregate per-day per-sport from activities.
+    daily_load: dict[date, dict] = defaultdict(
+        lambda: {
+            "load_by_sport": defaultdict(float),
+            "duration_min_by_sport": defaultdict(float),
+            "distance_km_by_sport": defaultdict(float),
+            "sessions_by_sport": defaultdict(int),
+        }
+    )
+    load_source_counts: dict[str, int] = defaultdict(int)
+    sports_seen: set[str] = set()
+
+    for a in acts:
+        if not isinstance(a, dict):
+            continue
+        d = parse_local_date(a)
+        if d is None:
+            continue
+        at = a.get("activityType") or {}
+        type_key = at.get("typeKey") if isinstance(at, dict) else ""
+        sport = bucket_for(type_key)
+        sports_seen.add(sport)
+
+        load, src = load_for(a)
+        load_source_counts[src] += 1
+        bucket = daily_load[d]
+        bucket["load_by_sport"][sport] += load
+        dur = a.get("duration") or a.get("movingDuration") or 0
+        try:
+            bucket["duration_min_by_sport"][sport] += float(dur) / 60.0
+        except (TypeError, ValueError):
+            pass
+        dist = a.get("distance") or 0
+        try:
+            bucket["distance_km_by_sport"][sport] += float(dist) / 1000.0
+        except (TypeError, ValueError):
+            pass
+        bucket["sessions_by_sport"][sport] += 1
+
+    if not daily_load:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "window_days": window_days,
+            "atl_decay_days": ATL_TAU,
+            "ctl_decay_days": CTL_TAU,
+            "per_day": {},
+            "weekly": [],
+            "totals": {
+                "activities": 0,
+                "sports_seen": [],
+                "load_source_counts": {},
+            },
+            "sport_composition": {"7d": {}, "28d": {}, "60d": {}},
+            "sport_shift": {"shifted": False, "details": []},
+            "notes": {
+                "load_source_priority": [
+                    "activityTrainingLoad",
+                    "te_weighted_duration",
+                    "duration_only",
+                ],
+                "empty": True,
+            },
+        }
+
+    # Build a contiguous date axis covering min..max of the activity window
+    # (extended back so the 28-day ACWR denominator has data the day after the
+    # first activity). Use end = max date or today, whichever is later.
+    first_d = min(daily_load.keys())
+    last_d = max(max(daily_load.keys()), date.today())
+    # Walk back 28 more days so day-0 ACWR has a denominator. We pad with zeros.
+    pad_start = first_d - timedelta(days=28)
+    axis: list[date] = list(daterange(pad_start, last_d))
+
+    loads = []
+    for d in axis:
+        b = daily_load.get(d)
+        if b is None:
+            loads.append(0.0)
+        else:
+            loads.append(sum(b["load_by_sport"].values()))
+
+    atls = ewma(loads, ATL_TAU)
+    ctls = ewma(loads, CTL_TAU)
+
+    # Per-sport daily-load series + EWMAs. Same axis as multi-sport so indices
+    # line up. Only emit sports that have at least one non-zero day in the
+    # window — sports that never appear are skipped entirely.
+    per_sport_loads: dict[str, list[float]] = {}
+    for sport in sports_seen:
+        series = []
+        for d in axis:
+            b = daily_load.get(d)
+            if b is None:
+                series.append(0.0)
+            else:
+                series.append(float(b["load_by_sport"].get(sport, 0.0)))
+        if any(v > 0 for v in series):
+            per_sport_loads[sport] = series
+
+    per_sport_atls: dict[str, list[float]] = {
+        sport: ewma(series, ATL_TAU) for sport, series in per_sport_loads.items()
+    }
+    per_sport_ctls: dict[str, list[float]] = {
+        sport: ewma(series, CTL_TAU) for sport, series in per_sport_loads.items()
+    }
+
+    acwr_coupled_num = rolling_mean(loads, 7)
+    acwr_coupled_den = rolling_mean(loads, 28)
+    # Uncoupled: 7-day window / preceding-21-day mean
+    acwr_uncoupled: list[float | None] = []
+    for i in range(len(loads)):
+        if i + 1 < 28:
+            acwr_uncoupled.append(None)
+            continue
+        seven = sum(loads[i - 6: i + 1]) / 7.0
+        prev_21 = sum(loads[i - 27: i - 6]) / 21.0
+        acwr_uncoupled.append((seven / prev_21) if prev_21 > 0 else None)
+
+    weekly_sum = rolling_sum(loads, 7)
+
+    per_day: dict[str, dict] = {}
+    for idx, d in enumerate(axis):
+        # Skip the 28-day zero-pad prefix — it exists to seed ACWR
+        # denominators and is not meaningful as a per-day output row.
+        if d < first_d:
+            continue
+
+        b = daily_load.get(d)
+        total_load = sum(b["load_by_sport"].values()) if b else 0.0
+        total_dur = sum(b["duration_min_by_sport"].values()) if b else 0.0
+        total_dist = sum(b["distance_km_by_sport"].values()) if b else 0.0
+        total_sess = sum(b["sessions_by_sport"].values()) if b else 0
+
+        # Monotony / strain over the 7-day window ending at this day.
+        if idx + 1 >= 7:
+            window = loads[idx - 6: idx + 1]
+            mean_w = sum(window) / 7.0
+            try:
+                stdev_w = statistics.pstdev(window)
+            except statistics.StatisticsError:
+                stdev_w = 0.0
+            monotony = (mean_w / stdev_w) if stdev_w > 0 else None
+            strain = (sum(window) * monotony) if monotony is not None else None
+        else:
+            monotony = None
+            strain = None
+
+        # Ramp rate: this week vs the week before.
+        if idx + 1 >= 14:
+            this_w = sum(loads[idx - 6: idx + 1])
+            last_w = sum(loads[idx - 13: idx - 6])
+            ramp = ((this_w - last_w) / last_w * 100.0) if last_w > 0 else None
+        else:
+            ramp = None
+
+        acwr_c = (
+            (acwr_coupled_num[idx] / acwr_coupled_den[idx])
+            if (acwr_coupled_num[idx] is not None and acwr_coupled_den[idx] not in (None, 0.0))
+            else None
+        )
+
+        # CTL is considered "warm" (~95% of steady-state) once the axis has
+        # CTL_WARMUP_DAYS of accumulated history. A typical 60-day analysis
+        # window starts at idx ≈ 28 and reaches at most idx ≈ 88 by today —
+        # below the 126-day threshold, so ctl_warm is False for normal
+        # short windows. This is a feature, not a bug: it tells the expert
+        # that absolute CTL/TSB values are biased low and only trends are
+        # safely interpretable.
+        ctl_warm = idx + 1 >= CTL_WARMUP_DAYS
+
+        by_sport_ewma: dict[str, dict] = {}
+        for sport, series in per_sport_loads.items():
+            s_ctl = per_sport_ctls[sport][idx]
+            s_atl = per_sport_atls[sport][idx]
+            by_sport_ewma[sport] = {
+                "load": round(series[idx], 1),
+                "ctl": round(s_ctl, 1),
+                "atl": round(s_atl, 1),
+                "tsb": round(s_ctl - s_atl, 1),
+            }
+
+        per_day[d.isoformat()] = {
+            "load_total": round(total_load, 1),
+            "load_by_sport": {k: round(v, 1) for k, v in (b["load_by_sport"].items() if b else [])},
+            "duration_min_total": round(total_dur, 1),
+            "duration_min_by_sport": {k: round(v, 1) for k, v in (b["duration_min_by_sport"].items() if b else [])},
+            "distance_km_total": round(total_dist, 2),
+            "distance_km_by_sport": {k: round(v, 2) for k, v in (b["distance_km_by_sport"].items() if b else [])},
+            "sessions_total": total_sess,
+            "sessions_by_sport": dict(b["sessions_by_sport"]) if b else {},
+            "atl": round(atls[idx], 1),
+            "ctl": round(ctls[idx], 1),
+            "tsb": round(ctls[idx] - atls[idx], 1),
+            "ctl_warm": ctl_warm,
+            "acwr_coupled": round(acwr_c, 2) if acwr_c is not None else None,
+            "acwr_uncoupled": round(acwr_uncoupled[idx], 2) if acwr_uncoupled[idx] is not None else None,
+            "ramp_rate_pct": round(ramp, 1) if ramp is not None else None,
+            "monotony": round(monotony, 2) if monotony is not None else None,
+            "strain": round(strain, 1) if strain is not None else None,
+            "weekly_load_7d": round(weekly_sum[idx], 1) if weekly_sum[idx] is not None else None,
+            "by_sport": by_sport_ewma,
+        }
+
+    # Weekly rollup (Monday-start). Drop padding weeks that fall entirely
+    # before any real activity.
+    by_week: dict[date, dict] = {}
+    for d, b in daily_load.items():
+        monday = d - timedelta(days=d.weekday())
+        wk = by_week.setdefault(
+            monday,
+            {
+                "week_start": monday.isoformat(),
+                "week_end": (monday + timedelta(days=6)).isoformat(),
+                "by_sport": defaultdict(
+                    lambda: {"sessions": 0, "duration_min": 0.0, "distance_km": 0.0, "load": 0.0}
+                ),
+            },
+        )
+        for sport, v in b["load_by_sport"].items():
+            wk["by_sport"][sport]["load"] += v
+        for sport, v in b["duration_min_by_sport"].items():
+            wk["by_sport"][sport]["duration_min"] += v
+        for sport, v in b["distance_km_by_sport"].items():
+            wk["by_sport"][sport]["distance_km"] += v
+        for sport, v in b["sessions_by_sport"].items():
+            wk["by_sport"][sport]["sessions"] += v
+
+    weekly: list[dict] = []
+    for monday in sorted(by_week.keys()):
+        wk = by_week[monday]
+        bys = {
+            sport: {
+                "sessions": vals["sessions"],
+                "duration_min": round(vals["duration_min"], 1),
+                "distance_km": round(vals["distance_km"], 2),
+                "load": round(vals["load"], 1),
+            }
+            for sport, vals in wk["by_sport"].items()
+        }
+        total_sess = sum(v["sessions"] for v in bys.values())
+        total_dur = sum(v["duration_min"] for v in bys.values())
+        total_load = sum(v["load"] for v in bys.values())
+        # Running+cycling km — the things that have meaningful distance.
+        total_km = sum(
+            v["distance_km"]
+            for sport, v in bys.items()
+            if sport in ("running", "cycling", "hiking", "walking", "swimming")
+        )
+        weekly.append(
+            {
+                "week_start": wk["week_start"],
+                "week_end": wk["week_end"],
+                "by_sport": bys,
+                "total_sessions": total_sess,
+                "total_duration_min": round(total_dur, 1),
+                "total_load": round(total_load, 1),
+                "total_km": round(total_km, 2),
+            }
+        )
+
+    totals = {
+        "activities": len(acts),
+        "sports_seen": sorted(sports_seen),
+        "load_source_counts": dict(load_source_counts),
+    }
+
+    # Sport composition over fixed look-back windows ending today. Use the
+    # axis tail so we share indexing with the per-sport series. The 60-day
+    # window also doubles as the baseline for sport_shift detection.
+    def composition_for(window_days_back: int) -> dict[str, float]:
+        n = min(window_days_back, len(loads))
+        if n <= 0:
+            return {}
+        total = sum(loads[-n:])
+        if total <= 0:
+            return {}
+        out: dict[str, float] = {}
+        for sport, series in per_sport_loads.items():
+            s = sum(series[-n:])
+            if s > 0:
+                out[sport] = round(s / total, 2)
+        return out
+
+    comp_7 = composition_for(7)
+    comp_28 = composition_for(28)
+    comp_60 = composition_for(60)
+
+    # Sport-shift detection: any sport whose 7d fraction differs from its
+    # 28d fraction by more than 0.15. The 28d comparison catches "recent
+    # change vs near-past" — using 60d would dilute a 2-3 week sport block
+    # in a longer baseline and miss the EWMA-relevant transition. Uses raw
+    # (unrounded) ratios so the threshold isn't sensitive to display rounding.
+    def raw_composition_for(window_days_back: int) -> dict[str, float]:
+        n = min(window_days_back, len(loads))
+        if n <= 0:
+            return {}
+        total = sum(loads[-n:])
+        if total <= 0:
+            return {}
+        return {
+            sport: sum(series[-n:]) / total
+            for sport, series in per_sport_loads.items()
+        }
+
+    raw_7 = raw_composition_for(7)
+    raw_28 = raw_composition_for(28)
+    SHIFT_THRESHOLD = 0.15
+    shift_entries: list[tuple[float, str]] = []
+    for sport in set(raw_7) | set(raw_28):
+        f7 = raw_7.get(sport, 0.0)
+        f28 = raw_28.get(sport, 0.0)
+        delta = f7 - f28
+        if abs(delta) > SHIFT_THRESHOLD:
+            direction = "up" if delta > 0 else "down"
+            shift_entries.append(
+                (
+                    abs(delta),
+                    f"{sport} fraction {direction} {abs(delta):.2f} in last 7d "
+                    f"({f28:.2f} → {f7:.2f}) vs 28d baseline",
+                )
+            )
+    shift_entries.sort(key=lambda t: t[0], reverse=True)
+    sport_shift = {
+        "shifted": bool(shift_entries),
+        "details": [s for _, s in shift_entries],
+    }
+
+    sport_composition = {"7d": comp_7, "28d": comp_28, "60d": comp_60}
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "window_days": window_days,
+        "atl_decay_days": ATL_TAU,
+        "ctl_decay_days": CTL_TAU,
+        "per_day": per_day,
+        "weekly": weekly,
+        "totals": totals,
+        "sport_composition": sport_composition,
+        "sport_shift": sport_shift,
+        "notes": {
+            "load_source_priority": [
+                "activityTrainingLoad",
+                "te_weighted_duration",
+                "duration_only",
+            ],
+            "atl_model": "Banister EWMA, tau=7 days, seeded from 0",
+            "ctl_model": "Banister EWMA, tau=42 days, seeded from 0. NOTE: with a 60-day window and zero pre-history, CTL is undersaturated until ~120 days of consistent load — early values of CTL/TSB in the first few weeks of a fresh fetch are biased low.",
+            "tsb_definition": "CTL - ATL (positive = freshness, negative = fatigue)",
+            "acwr_coupled": "7-day mean load / 28-day mean load",
+            "acwr_uncoupled": "7-day mean load / preceding 21-day mean load",
+            "ramp_rate": "(this-week sum - last-week sum) / last-week sum * 100",
+            "padding": "Date axis padded back 28 days from first activity with zero-load days to seed ACWR denominators.",
+            "per_sport_ewma": "per_day[<date>].by_sport[<sport>] carries the same CTL/ATL/TSB math applied to that sport's daily-load series only — use it alongside the multi-sport numbers when the athlete's race is sport-specific.",
+            "sport_shift_threshold": "sport_shift triggers when any sport's 7d composition fraction differs from its 28d fraction by more than 0.15. The 28d baseline catches recent transitions; using 60d would dilute multi-week sport blocks.",
+        },
+    }
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compute peak-lab training metrics from raw.json",
+    )
+    parser.add_argument("raw", help="Path to raw.json from bin/fetch-garmin")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output path (default: training-metrics.json next to raw.json)",
+    )
+    args = parser.parse_args(argv[1:])
+
+    src = Path(args.raw)
+    if not src.exists():
+        print(f"error: input file not found: {src}", file=sys.stderr)
+        return 1
+    try:
+        raw = json.loads(src.read_text())
+    except json.JSONDecodeError as e:
+        print(f"error: invalid JSON in {src}: {e}", file=sys.stderr)
+        return 1
+
+    out_path = Path(args.out) if args.out else src.parent / "training-metrics.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result = compute(raw)
+    out_path.write_text(json.dumps(result, indent=2))
+    n_days = len(result["per_day"])
+    n_weeks = len(result["weekly"])
+    sports = ", ".join(result["totals"]["sports_seen"]) or "none"
+    print(
+        f"wrote {out_path} ({n_days} days, {n_weeks} weeks, sports: {sports})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,300 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["scipy"]
+# ///
+"""Build the "heart rate vs pace, over the lab zones" section and inject it into analysis.html.
+
+Usage:
+  uv run --quiet bin/hrpace-lab-section <raw.json> <lab-zones.json> [--out FRAGMENT.html] [--inject ANALYSIS.html]
+
+Plots every steady aerobic run (easy + long; track sessions and the lab-test day excluded)
+on a pace(x) vs average-heart-rate(y) chart, shaded by the lab's TZ1/TZ2/TZ3 zones, with the
+lab ramp as a grey reference curve and a robust per-month (Theil-Sen) trend on the easy runs.
+Factual labels only — no interpretation. Idempotent injection (replaces any prior section).
+"""
+import argparse, json, math, re, sys
+from pathlib import Path
+from scipy.stats import theilslopes
+
+LONG_MIN = 85          # a "long run" = time on feet >= ~90 min
+REG_MIN_N = 4          # months need at least this many easy runs to draw a trend
+MON = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+OPEN_MARK = "<!-- BEGIN HRPACE-LAB SECTION (project-local injection) -->"
+CLOSE_MARK = "<!-- END HRPACE-LAB SECTION (project-local injection) -->"
+
+
+def fp(sec):
+    m = int(sec // 60); s = int(round(sec - m * 60))
+    if s == 60:
+        m += 1; s = 0
+    return f"{m}:{s:02d}"
+
+
+def star_pts(cx, cy, ro):
+    ri = ro * 0.42
+    out = []
+    for i in range(10):
+        ang = -math.pi / 2 + i * math.pi / 5
+        rr = ro if i % 2 == 0 else ri
+        out.append(f"{cx+rr*math.cos(ang):.1f},{cy+rr*math.sin(ang):.1f}")
+    return " ".join(out)
+
+
+def halo(cx, cy, fill):
+    return [f'<circle cx="{cx}" cy="{cy}" r="6" fill="{fill}"/>',
+            f'<circle cx="{cx}" cy="{cy}" r="8" fill="none" stroke="#fff" stroke-width="2"/>',
+            f'<circle cx="{cx}" cy="{cy}" r="10" fill="none" stroke="#222" stroke-width="1.4"/>']
+
+
+def month_palette(keys):
+    """keys: sorted list of 'YYYY-MM'. Light (oldest) -> dark (newest) purple, one shade each."""
+    lo, hi = (203, 201, 226), (63, 0, 125)        # #cbc9e2 -> #3f007d
+    out = {}
+    k = len(keys)
+    for i, mk in enumerate(keys):
+        t = i / (k - 1) if k > 1 else 1.0
+        out[mk] = "rgb(%d,%d,%d)" % tuple(int(lo[j] + t * (hi[j] - lo[j])) for j in range(3))
+    return out
+
+
+def extract_runs(raw, lab_test_date, z_hi):
+    runs = []
+    for a in raw.get('activities', []):
+        tk = a.get('activityType', {}).get('typeKey', '')
+        if 'running' not in tk:
+            continue
+        dist = a.get('distance', 0) / 1000.0
+        dur = (a.get('movingDuration') or a.get('duration') or 0) / 60.0
+        hr = a.get('averageHR')
+        if not dist or not dur or not hr:
+            continue
+        date = str(a.get('startTimeLocal', ''))[:10]
+        if date == lab_test_date:                          # exclude the lab test itself
+            continue
+        if 'track' in tk and hr >= z_hi:                   # exclude track QUALITY (keep easy track jogs)
+            continue
+        runs.append({'date': date, 'mk': date[:7], 'km': dist,
+                     'p': (dur / dist) * 60, 'hr': float(hr), 'long': dur >= LONG_MIN})
+    runs.sort(key=lambda r: r['date'])
+    return runs
+
+
+def build_section(raw, lab):
+    Z_LO, Z_HI = lab['zone_hr_boundaries']
+    lab_pts = sorted((3600.0 / d['speed_kmh'], float(d['hr'])) for d in lab['level_data'])
+    runs = extract_runs(raw, lab.get('test_date'), Z_HI)
+    if not runs:
+        return "<section><p>No runs found for the HR/pace chart.</p></section>"
+
+    latest = max(r['date'] for r in runs)
+    mkeys = sorted({r['mk'] for r in runs})
+    MC = month_palette(mkeys)
+
+    easy = [r for r in runs if not r['long']]
+    longs = [r for r in runs if r['long']]
+    n_all, n_easy, n_long = len(runs), len(easy), len(longs)
+
+    # ---- geometry from data + lab ----
+    all_p = [r['p'] for r in runs] + [p for p, _ in lab_pts]
+    all_h = [r['hr'] for r in runs] + [h for _, h in lab_pts]
+    xmin, xmax = min(all_p) - 10, max(all_p) + 12
+    ymin, ymax = min(min(all_h), Z_LO) - 5, max(max(all_h), Z_HI) + 4
+    L, T, W, H = 80, 50, 760, 470
+    def X(p): return L + (p - xmin) / (xmax - xmin) * W
+    def Y(h): return T + H - (h - ymin) / (ymax - ymin) * H
+
+    S = []
+    VBH = T + H + 96
+    S.append(f'<svg viewBox="0 0 {L+W+30} {VBH}" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,sans-serif">')
+    S.append(f'<rect width="{L+W+30}" height="{VBH}" fill="#fbfbfd"/>')
+
+    # zone bands
+    bands = [(ymin, Z_LO, '#e3f3e8', '#3a8a4f'), (Z_LO, Z_HI, '#fdf2d4', '#b8860b'), (Z_HI, ymax, '#fce1e1', '#c0392b')]
+    for (lo, hi, fill, ink), z in zip(bands, lab['zones']):
+        S.append(f'<rect x="{L}" y="{Y(hi)}" width="{W}" height="{Y(lo)-Y(hi)}" fill="{fill}"/>')
+        yc = (Y(hi) + Y(lo)) / 2
+        S.append(f'<text x="{L+10}" y="{yc-3}" font-size="13" font-weight="700" fill="{ink}">{z["key"]} · {z["name"]}</text>')
+        S.append(f'<text x="{L+10}" y="{yc+13}" font-size="11" fill="{ink}" opacity="0.85">HR {z["hr"]} · {z["pace"]}</text>')
+    for hb in (Z_LO, Z_HI):
+        S.append(f'<line x1="{L}" y1="{Y(hb)}" x2="{L+W}" y2="{Y(hb)}" stroke="#999" stroke-width="1" stroke-dasharray="2 3"/>')
+
+    # axes
+    h0 = int(math.ceil(ymin / 10) * 10)
+    for hh in range(h0, int(ymax) + 1, 10):
+        S.append(f'<text x="{L-10}" y="{Y(hh)+4}" font-size="11.5" fill="#777" text-anchor="end">{hh}</text>')
+        S.append(f'<line x1="{L}" y1="{Y(hh)}" x2="{L-5}" y2="{Y(hh)}" stroke="#bbb"/>')
+    p0 = int(math.ceil(xmin / 30) * 30)
+    for pp in range(p0, int(xmax) + 1, 30):
+        S.append(f'<text x="{X(pp)}" y="{T+H+20}" font-size="11.5" fill="#777" text-anchor="middle">{fp(pp)}</text>')
+        S.append(f'<line x1="{X(pp)}" y1="{T+H}" x2="{X(pp)}" y2="{T+H+5}" stroke="#bbb"/>')
+    S.append(f'<rect x="{L}" y="{T}" width="{W}" height="{H}" fill="none" stroke="#c4c7cd"/>')
+    S.append(f'<text x="{L+W/2}" y="{T+H+44}" font-size="12.5" fill="#333" text-anchor="middle" font-weight="600">average pace (min/km) &#8594; slower</text>')
+    S.append(f'<text x="22" y="{T+H/2}" font-size="12.5" fill="#333" text-anchor="middle" font-weight="600" transform="rotate(-90 22 {T+H/2})">average heart rate (bpm)</text>')
+
+    # grey lab curve in the BACKGROUND
+    path = ' '.join(f'{"M" if i==0 else "L"}{X(p):.1f},{Y(h):.1f}' for i, (p, h) in enumerate(lab_pts))
+    S.append(f'<path d="{path}" fill="none" stroke="#c4c4ca" stroke-width="2"/>')
+    for p, h in lab_pts:
+        S.append(f'<circle cx="{X(p)}" cy="{Y(h)}" r="3.4" fill="#c4c4ca"/>')
+        S.append(f'<text x="{X(p)-7}" y="{Y(h)-7}" font-size="10" fill="#b4b4ba">{int(h)}</text>')
+
+    # run markers
+    for r in runs:
+        cx, cy, c = X(r['p']), Y(r['hr']), MC[r['mk']]
+        if r['long']:
+            S.append(f'<polygon points="{star_pts(cx,cy,9.5)}" fill="{c}" stroke="#333" stroke-width="1"/>')
+        elif r['date'] == latest:
+            S.extend(halo(cx, cy, c))
+        else:
+            S.append(f'<circle cx="{cx}" cy="{cy}" r="5.4" fill="{c}" fill-opacity="0.85" stroke="#fff" stroke-width="0.8"/>')
+
+    # per-month robust trend (easy runs only)
+    REF = round(sorted(r['p'] for r in easy)[len(easy) // 2])
+    lab_m, lab_b = theilslopes([h for _, h in lab_pts], [p for p, _ in lab_pts])[:2]
+    lab_ref = lab_m * REF + lab_b
+    reg_rows = []
+    for mk in mkeys:
+        g = [r for r in easy if r['mk'] == mk]
+        if len(g) < REG_MIN_N:
+            continue
+        xs = [r['p'] for r in g]; ys = [r['hr'] for r in g]
+        slope, intercept, lo, hi = theilslopes(ys, xs)
+        x0, x1 = min(xs), max(xs)
+        c = MC[mk]
+        for w, col_, dash in ((4.2, '#fff', None), (2.2, c, '7 4')):
+            d = f' stroke-dasharray="{dash}"' if dash else ''
+            S.append(f'<line x1="{X(x0)}" y1="{Y(slope*x0+intercept)}" x2="{X(x1)}" y2="{Y(slope*x1+intercept)}" stroke="{col_}" stroke-width="{w}"{d} stroke-linecap="round"/>')
+        lab_mon = MON[int(mk[5:7])]
+        S.append(f'<text x="{X(x1)+6}" y="{Y(slope*x1+intercept)+4}" font-size="11" font-weight="700" fill="{c}">{lab_mon}</text>')
+        reg_rows.append((lab_mon, len(g), slope, lo, hi, slope * REF + intercept))
+
+    # hover targets on top
+    for r in runs:
+        cx, cy = X(r['p']), Y(r['hr'])
+        zone = lab['zones'][0]['key'] if r['hr'] < Z_LO else (lab['zones'][1]['key'] if r['hr'] <= Z_HI else lab['zones'][2]['key'])
+        typ = 'long run' if r['long'] else ('easy run (latest)' if r['date'] == latest else 'easy run')
+        S.append(f'<circle class="hrp-run" cx="{cx}" cy="{cy}" r="11" fill="transparent" '
+                 f'data-date="{r["date"]}" data-km="{r["km"]:.1f}" data-pace="{fp(r["p"])}" '
+                 f'data-hr="{r["hr"]:.0f}" data-zone="{zone}" data-type="{typ}"/>')
+
+    # legend
+    yL = T + H + 70
+    lx = L + 4
+    S.append(f'<path d="M{lx},{yL} L{lx+20},{yL}" stroke="#c4c4ca" stroke-width="2.4"/><circle cx="{lx+10}" cy="{yL}" r="4" fill="#c4c4ca"/>')
+    S.append(f'<text x="{lx+27}" y="{yL+4}" font-size="11.5" fill="#333">lab test (HR per pace)</text>')
+    sx = L + 196
+    S.append(f'<polygon points="{star_pts(sx, yL, 7.5)}" fill="#9e9ac8" stroke="#333" stroke-width="0.8"/>')
+    S.append(f'<text x="{sx+13}" y="{yL+4}" font-size="11.5" fill="#333">long run (&#8805;90 min)</text>')
+    tx = L + 370
+    S.extend(halo(tx, yL, MC[mkeys[-1]]))
+    S.append(f'<text x="{tx+15}" y="{yL+4}" font-size="11.5" fill="#333">latest run</text>')
+    gx, sw = L + 478, max(18, min(40, int(330 / max(1, len(mkeys)))))
+    for i, mk in enumerate(mkeys):
+        S.append(f'<rect x="{gx+i*sw}" y="{yL-7}" width="{sw}" height="11" fill="{MC[mk]}" stroke="#fff" stroke-width="0.6"/>')
+        S.append(f'<text x="{gx+i*sw+sw/2}" y="{yL+15}" font-size="9" fill="#999" text-anchor="middle">{MON[int(mk[5:7])]}</text>')
+    S.append('</svg>')
+
+    # tally + table
+    z = [sum(1 for r in runs if r['hr'] < Z_LO),
+         sum(1 for r in runs if Z_LO <= r['hr'] <= Z_HI),
+         sum(1 for r in runs if r['hr'] > Z_HI)]
+    pills = "".join(
+        f'<span class="hrp-pill hrp-p{i+1}">{lab["zones"][i]["key"]} {lab["zones"][i]["name"]}: {z[i]} of {n_all}</span>'
+        for i in range(3))
+    reg = ("<table class='hrp-reg'><tr><th>Month</th><th>runs</th>"
+           "<th>HR cost per 30 s/km faster</th><th>95% CI</th>"
+           f"<th>predicted HR @ {fp(REF)}/km</th><th>vs lab line</th></tr>")
+    for name, nn, slope, lo, hi, predref in reg_rows:
+        reg += (f"<tr><td>{name}</td><td>{nn}</td><td>+{-slope*30:.1f} bpm</td>"
+                f"<td>[{-hi*30:.1f}, {-lo*30:.1f}]</td><td>{predref:.0f} bpm</td>"
+                f"<td>{predref-lab_ref:+.0f} bpm</td></tr>")
+    reg += (f"<tr style='color:#666'><td>lab</td><td>&mdash;</td><td>+{-lab_m*30:.1f} bpm</td>"
+            f"<td>&mdash;</td><td>{lab_ref:.0f} bpm</td><td>0</td></tr></table>")
+
+    d0, d1 = runs[0]['date'], runs[-1]['date']
+    def pretty(dt):
+        return f"{MON[int(dt[5:7])]} {int(dt[8:10])}"
+    sub = (f"{pretty(d0)} – {pretty(d1)} · {n_all} aerobic runs ({n_easy} easy &#9679; + {n_long} long ★) · "
+           f"track / lab-test sessions excluded · grey = {lab.get('source','lab test')} · <i>hover any run for detail</i>")
+
+    return f"""<section id="hrpace-lab-section">
+<style>
+#hrpace-lab-section{{margin:22px 0 6px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1d1d1f}}
+#hrpace-lab-section h2{{font-size:19px;margin:0 0 4px}}
+#hrpace-lab-section .hrp-sub{{color:#666;font-size:13px;margin-bottom:12px}}
+#hrpace-lab-section .hrp-card{{background:#fff;border:1px solid #e7e7ec;border-radius:14px;padding:12px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+#hrpace-lab-section .hrp-note{{font-size:13.5px;line-height:1.6;color:#333;margin-top:14px}}
+#hrpace-lab-section .hrp-pill{{display:inline-block;border-radius:20px;padding:3px 11px;font-size:12.5px;margin:2px 5px 2px 0;font-weight:600}}
+#hrpace-lab-section .hrp-p1{{background:#e3f3e8;color:#2c6e41}} #hrpace-lab-section .hrp-p2{{background:#fdf2d4;color:#9a730a}} #hrpace-lab-section .hrp-p3{{background:#fce1e1;color:#a5311f}}
+#hrpace-lab-section .hrp-run{{cursor:pointer}} #hrpace-lab-section .hrp-run:hover{{stroke:#111;stroke-width:2;stroke-opacity:0.55}}
+#hrpace-lab-section table.hrp-reg{{border-collapse:collapse;margin:6px 0 2px;font-size:12.5px}}
+#hrpace-lab-section table.hrp-reg th,#hrpace-lab-section table.hrp-reg td{{border:1px solid #e3e3ea;padding:4px 10px;text-align:center}}
+#hrpace-lab-section table.hrp-reg th{{background:#f3f1f8;font-weight:600;color:#444}} #hrpace-lab-section table.hrp-reg td:first-child{{font-weight:700}}
+#hrpace-tt{{position:fixed;pointer-events:none;background:#111;color:#fff;padding:6px 9px;border-radius:6px;font-size:12px;line-height:1.45;opacity:0;transition:opacity .08s;z-index:30;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.25)}}
+</style>
+<h2>Heart rate vs pace, over your lab training zones</h2>
+<div class="hrp-sub">{sub}</div>
+<div class="hrp-card">{''.join(S)}</div>
+<div id="hrpace-tt"></div>
+<div class="hrp-note">
+<div style="font-size:12px;color:#777;margin-bottom:4px">Zone tally counts <b>all {n_all} aerobic runs</b> (easy &#9679; + long ★ together):</div>
+{pills}
+<p style="margin-top:12px"><b>How to read this chart.</b> Each marker is one run, plotted by average pace (x) and average heart rate (y), coloured by month. &#9679; = easy/daily run, ★ = long run (&#8805;90 min), ◎ = latest run. The <b>grey line</b> is the lab test — the heart rate measured at each treadmill speed. The three shaded bands are the lab's training zones. The <b>dashed lines</b> are a robust per-month trend (Theil-Sen, easy runs only, drawn across each month's observed pace range).</p>
+<p style="font-weight:600;margin:14px 0 2px">Per-month trend — easy runs only <span style="font-weight:400;color:#888">(long runs excluded; their cardiac drift would bias the pace↔HR fit)</span></p>
+{reg}
+<p style="font-size:12.5px;color:#666;margin-top:4px">Table columns — <b>“HR cost per 30 s/km faster”</b>: the trend line's steepness (beats of heart-rate rise per 30 s/km of faster pace), with its 95% confidence interval. <b>“Predicted HR @ {fp(REF)}/km”</b>: each month's trend at a fixed reference pace. <b>“vs lab line”</b>: that predicted HR minus the lab line at the same pace.</p>
+</div>
+<script>
+(function(){{
+  var tt=document.getElementById('hrpace-tt');
+  document.querySelectorAll('#hrpace-lab-section .hrp-run').forEach(function(el){{
+    el.addEventListener('mouseenter',function(){{var d=el.dataset;
+      tt.innerHTML='<b>'+d.date+'</b> &middot; '+d.type+'<br>'+d.km+' km &middot; '+d.pace+'/km &middot; HR '+d.hr+'<br>'+d.zone;tt.style.opacity=1;}});
+    el.addEventListener('mousemove',function(e){{var x=e.clientX+14,y=e.clientY+14;if(x>window.innerWidth-180)x=e.clientX-170;tt.style.left=x+'px';tt.style.top=y+'px';}});
+    el.addEventListener('mouseleave',function(){{tt.style.opacity=0;}});
+  }});
+}})();
+</script>
+</section>"""
+
+
+def inject(analysis_path, fragment):
+    doc = analysis_path.read_text()
+    doc = re.sub(re.escape(OPEN_MARK) + r".*?" + re.escape(CLOSE_MARK), "", doc, flags=re.DOTALL)
+    block = f"\n{OPEN_MARK}\n{fragment}\n{CLOSE_MARK}\n"
+    idx = doc.lower().rfind("</body>")
+    doc = (doc.rstrip() + block + "\n") if idx < 0 else (doc[:idx] + block + doc[idx:])
+    analysis_path.write_text(doc)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument('raw')
+    ap.add_argument('lab')
+    ap.add_argument('--out')
+    ap.add_argument('--inject')
+    args = ap.parse_args(argv)
+
+    raw = json.loads(Path(args.raw).read_text())
+    lab = json.loads(Path(args.lab).read_text())
+    fragment = build_section(raw, lab)
+
+    if args.out:
+        Path(args.out).write_text(fragment)
+        print(f"wrote fragment {args.out}")
+    if args.inject:
+        p = Path(args.inject)
+        if not p.exists():
+            print(f"error: inject target not found: {p}", file=sys.stderr)
+            return 1
+        inject(p, fragment)
+        print(f"injected HR/pace-lab section into {p}")
+    if not args.out and not args.inject:
+        sys.stdout.write(fragment)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

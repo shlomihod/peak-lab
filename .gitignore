@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+.env
+
+# peak-lab runtime data — should never be in the plugin source repo.
+# In normal use peak-lab writes to the user's separate training-project
+# folder, not here. These entries are a safety net in case someone
+# accidentally runs peak-lab from inside the plugin source.
+profile.md
+runs/
+garmin-call.log
+peak-lab-data/

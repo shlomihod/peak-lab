@@ -1,0 +1,144 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "garminconnect>=0.3.2",
+#     "curl_cffi>=0.6",
+# ]
+# ///
+"""
+garmin-auth: one-time interactive Garmin Connect login for peak-lab.
+
+Prompts for email, password, and MFA (if required), then saves DI OAuth
+tokens to ~/.garminconnect/garmin_tokens.json. Subsequent peak-lab runs
+read the saved tokens and never see your password.
+
+Usage:
+    garmin-auth                # interactive
+    garmin-auth --verify       # check whether saved tokens still work
+    garmin-auth --force        # re-login even if saved tokens are valid
+
+Replaces the old garmin-mcp-auth flow, which depended on the now-deprecated
+`garth` library that Garmin's auth changes broke in 2026.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import sys
+from pathlib import Path
+
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+
+
+def tokenstore_path() -> str:
+    return str(Path(os.getenv("GARMINTOKENS", "~/.garminconnect")).expanduser())
+
+
+def try_restore() -> Garmin | None:
+    path = tokenstore_path()
+    if not Path(path).exists():
+        return None
+    try:
+        api = Garmin()
+        api.login(path)
+        return api
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError):
+        return None
+
+
+def verify() -> int:
+    api = try_restore()
+    if api is None:
+        print("✗ No valid saved tokens. Run `garmin-auth` to log in.", file=sys.stderr)
+        return 1
+    try:
+        name = api.get_full_name()
+    except Exception as e:
+        print(f"✗ Tokens loaded but API call failed: {e}", file=sys.stderr)
+        return 1
+    print(f"✓ Tokens valid. Logged in as: {name}")
+    print(f"  Stored at: {tokenstore_path()}")
+    return 0
+
+
+def login_interactive() -> int:
+    path = tokenstore_path()
+    print("\n" + "=" * 60)
+    print("peak-lab — Garmin Connect login")
+    print("=" * 60)
+    print(f"Tokens will be saved to: {path}")
+    print("Your password is never stored — only the OAuth tokens.\n")
+
+    email = os.getenv("GARMIN_EMAIL") or input("Email: ").strip()
+    if not email:
+        print("Email is required.", file=sys.stderr)
+        return 2
+    password = os.getenv("GARMIN_PASSWORD") or getpass.getpass("Password: ")
+    if not password:
+        print("Password is required.", file=sys.stderr)
+        return 2
+
+    def prompt_mfa() -> str:
+        print("\nGarmin sent an MFA code to your email/phone.")
+        return input("MFA code: ").strip()
+
+    try:
+        api = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
+        api.login(path)
+    except GarminConnectTooManyRequestsError as e:
+        print(f"\n✗ Rate limited by Garmin: {e}", file=sys.stderr)
+        print("  Wait 15-60 minutes before retrying. Garmin throttles by IP.", file=sys.stderr)
+        return 1
+    except GarminConnectAuthenticationError as e:
+        print(f"\n✗ Authentication failed: {e}", file=sys.stderr)
+        print("  Check email, password, and MFA code.", file=sys.stderr)
+        return 1
+    except GarminConnectConnectionError as e:
+        print(f"\n✗ Connection error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"\n✗ Unexpected error: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        name = api.get_full_name()
+        print(f"\n✓ Login successful. Welcome, {name}.")
+    except Exception:
+        print("\n✓ Login successful (could not fetch profile name, but tokens saved).")
+    print(f"  Tokens saved to: {path}")
+    print("\nYou can now run /peak-lab:analyze.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="peak-lab Garmin Connect login")
+    parser.add_argument("--verify", action="store_true", help="check saved tokens")
+    parser.add_argument("--force", action="store_true", help="re-login even if tokens valid")
+    args = parser.parse_args()
+
+    if args.verify:
+        return verify()
+
+    if not args.force:
+        existing = try_restore()
+        if existing is not None:
+            try:
+                name = existing.get_full_name()
+                print(f"✓ Already logged in as {name}. Use --force to re-login.")
+                return 0
+            except Exception:
+                pass
+
+    return login_interactive()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

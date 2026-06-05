@@ -1,0 +1,2517 @@
+#!/usr/bin/env python3
+"""
+render-analysis v2: turn analysis.json into a self-contained HTML dashboard.
+
+Design goals:
+- Plain-language labels for every technical term, with tooltips for the
+  formal abbreviation (ACWR, CTL, TSB, HRV, etc.)
+- Inline SVG time-series charts (training load, HRV, sleep, weekly volume)
+  generated from raw.json if it can be found next to analysis.json
+- Progressive disclosure: headline first, deep-dive experts collapsed by
+  default via native <details> elements — no JavaScript
+- Hero "Today" panel acknowledging any session already logged today
+- Mobile-friendly responsive CSS grid
+- Glossary at the bottom for every term used
+
+Usage:
+    render-analysis <analysis.json> <output.html> [--raw RAW_JSON]
+
+If --raw is not provided, the script looks for `raw.json` in the same
+directory as <analysis.json>. Without raw.json, the charts section is
+silently omitted and the rest of the report still renders.
+
+Zero external dependencies — stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import math
+import subprocess
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+# Shared sport-bucket mapping. Lives next to this script so the renderer's
+# fallback aggregation (when training-metrics.json is absent) uses the same
+# buckets / colors / distance-sports tuple as the helper that produces the
+# metrics file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from peak_lab_sports import (  # noqa: E402
+    BUCKETS as _SPORT_BUCKETS,
+    COLORS as _SPORT_COLORS,
+    DISTANCE_SPORTS,
+    bucket_for as _sport_bucket,
+)
+
+# ---------------------------------------------------------------------------
+# Glossary: every technical term that appears in peak-lab output
+# ---------------------------------------------------------------------------
+
+GLOSSARY: dict[str, tuple[str, str]] = {
+    # key: (plain-language name, definition)
+    "ACWR": (
+        "Load Strain Ratio",
+        "Acute:Chronic Workload Ratio. Your recent (7-day) training load divided "
+        "by your sustained (28-day) load. 0.8–1.3 is the sweet spot where fitness "
+        "grows without undue injury risk. Above 1.5 = risky; below 0.8 = detraining.",
+    ),
+    "CTL": (
+        "Fitness",
+        "Chronic Training Load. An exponential weighted average of the last ~42 "
+        "days of training load. Rising CTL means your aerobic base is growing. "
+        "Peak CTL going into a goal race is typically well above your early-base "
+        "level — judge it by your own trend, not an absolute target.",
+    ),
+    "ATL": (
+        "Fatigue",
+        "Acute Training Load. A fast-decaying average (~7 days) of recent load — "
+        "how tired you are right now. High after hard sessions, drops quickly "
+        "with rest.",
+    ),
+    "TSB": (
+        "Form / Freshness",
+        "Training Stress Balance = Fitness − Fatigue. Positive TSB means you're "
+        "fresh (good for race day). Negative TSB means you're in a training "
+        "block and tired (normal and desired during build phases).",
+    ),
+    "HRV": (
+        "Heart Rate Variability",
+        "The tiny variations in time between heartbeats, measured overnight. "
+        "Higher HRV = parasympathetic recovery / well-recovered. A personal "
+        "baseline is more meaningful than absolute numbers.",
+    ),
+    "RHR": (
+        "Resting Heart Rate",
+        "Your heart rate at rest, measured overnight. Lower is typically better. "
+        "A sustained rise of 5+ bpm above your personal baseline often "
+        "signals accumulated fatigue or an approaching illness.",
+    ),
+    "SpO2": (
+        "Blood Oxygen",
+        "Oxygen saturation of your blood, measured by a pulse oximeter. Healthy "
+        "overnight readings stay above 90%. Recurrent drops below 88% can "
+        "signal sleep-disordered breathing (e.g. sleep apnea).",
+    ),
+    "REM": (
+        "REM Sleep",
+        "Rapid Eye Movement sleep, the dream stage. Critical for emotional "
+        "regulation, memory consolidation, and hormonal recovery. Optimal is "
+        "roughly 20–30% of total sleep time.",
+    ),
+    "VO2max": (
+        "Aerobic Ceiling",
+        "The maximum rate at which your body can use oxygen during exercise, "
+        "expressed in mL per kg of body weight per minute. The single best "
+        "lab-measurable predictor of endurance performance.",
+    ),
+    "VDOT": (
+        "Daniels Performance Score",
+        "Jack Daniels' pseudo-VO2max: a single number derived from a race "
+        "performance that predicts race times at other distances and sets "
+        "training paces (Easy/Marathon/Threshold/Interval/Repetition).",
+    ),
+    "TSS": (
+        "Training Stress",
+        "A unitless score for the stress of a single session. 100 TSS ≈ one "
+        "hour at threshold effort. Used to drive fitness/fatigue models.",
+    ),
+    "E pace": (
+        "Easy Pace",
+        "~65–78% of your VO2max. The pace 80% of your weekly mileage should "
+        "be run at. Builds aerobic base, fat oxidation, capillary density. "
+        "Should feel conversational.",
+    ),
+    "M pace": (
+        "Marathon Pace",
+        "~80–84% of VO2max. Your goal marathon pace. Practiced in marathon-"
+        "specific long runs and tune-up races.",
+    ),
+    "T pace": (
+        "Threshold Pace",
+        "~86–88% of VO2max. The pace you could hold all-out for about an "
+        "hour. The main 'quality' session in a marathon build: tempo runs "
+        "and cruise intervals.",
+    ),
+    "I pace": (
+        "Interval Pace",
+        "~95–100% of VO2max. The pace for VO2max repeats, typically 3–5 "
+        "minute intervals with equal-time rest. Trains your aerobic ceiling.",
+    ),
+    "R pace": (
+        "Repetition Pace",
+        "~105–110% of VO2max. Very fast, short reps (200–400 m) with full "
+        "recovery. Trains speed and running economy, not aerobic fitness.",
+    ),
+    "aerobic base": (
+        "Aerobic Base",
+        "The volume of easy running that develops capillary density, "
+        "mitochondrial adaptation, and fat metabolism. The foundation every "
+        "marathon is built on.",
+    ),
+    "polarization": (
+        "Polarized Training",
+        "An intensity distribution where ~80% of sessions are genuinely easy "
+        "and ~20% are genuinely hard, with very little 'moderate'. Research-"
+        "backed approach for endurance performance.",
+    ),
+    "readiness": (
+        "Readiness Score",
+        "Garmin's daily 0–100 score estimating how ready you are to absorb "
+        "training load today, combining HRV, sleep, recent stress, and "
+        "acute training load.",
+    ),
+    "knee tracking": (
+        "Knee Tracking",
+        "How the knee moves during running — whether it stays aligned over "
+        "the foot or drifts inward/outward under load. Drifting knees are "
+        "often caused by weak glute medius and adductors and can lead to "
+        "runner's knee pain.",
+    ),
+}
+
+
+def gdef(term: str) -> str:
+    """Return the full definition for a known term."""
+    return GLOSSARY.get(term, ("", term))[1]
+
+
+# ---------------------------------------------------------------------------
+# Garmin enum → plain-language map. Applied to all user-facing text via
+# humanize_garmin_text(), so the experts (and Garmin's own API) can speak
+# in their native enum dialect and we clean it up at render time.
+# ---------------------------------------------------------------------------
+
+GARMIN_ENUM_HUMAN: dict[str, str] = {
+    # Training effect labels
+    "LACTATE_THRESHOLD": "lactate threshold",
+    "AEROBIC_BASE": "aerobic base",
+    "ANAEROBIC_CAPACITY": "anaerobic",
+    "TEMPO": "tempo",
+    "VO2MAX": "VO₂max",
+    "VO2_MAX": "VO₂max",
+    "RECOVERY": "recovery",
+    "THRESHOLD": "threshold",
+    "FORCED_REST": "rest day",
+    "INVALID": "rest",
+    "SPEED": "speed",
+    "ENDURANCE": "endurance",
+    # Training status
+    "MAINTAINING": "maintaining",
+    "MAINTAINING_1": "maintaining",
+    "MAINTAINING_2": "maintaining",
+    "MAINTAINING_3": "maintaining",
+    "MAINTAINING_4": "maintaining",
+    "PRODUCTIVE": "productive",
+    "PRODUCTIVE_1": "productive",
+    "PRODUCTIVE_2": "productive",
+    "PRODUCTIVE_3": "productive",
+    "PEAKING": "peaking",
+    "DETRAINING": "detraining",
+    "OVERREACHING": "overreaching",
+    "UNPRODUCTIVE": "unproductive",
+    "RECOVERY_1": "recovery",
+    "RECOVERY_2": "recovery",
+    "STRAINED": "strained",
+    # ACWR status
+    "OPTIMAL": "optimal",
+    "OPTIMAL_LOW": "optimal (low side)",
+    "OPTIMAL_HIGH": "optimal (high side)",
+    "HIGH": "high",
+    "LOW": "low",
+    "VERY_HIGH": "very high",
+    "VERY_LOW": "very low",
+    # Load balance feedback
+    "AEROBIC_LOW_SHORTAGE": "low-aerobic shortage",
+    "LOW_AEROBIC_SHORTAGE": "low-aerobic shortage",
+    "AEROBIC_LOW_OVERAGE": "low-aerobic overage",
+    "LOW_AEROBIC_OVERAGE": "low-aerobic overage",
+    "AEROBIC_HIGH_SHORTAGE": "high-aerobic shortage",
+    "HIGH_AEROBIC_SHORTAGE": "high-aerobic shortage",
+    "AEROBIC_HIGH_OVERAGE": "high-aerobic overage",
+    "HIGH_AEROBIC_OVERAGE": "high-aerobic overage",
+    "ANAEROBIC_SHORTAGE": "anaerobic shortage",
+    "ANAEROBIC_OVERAGE": "anaerobic overage",
+    "BALANCED": "balanced",
+    # Sleep feedback
+    "NEGATIVE_NOT_ENOUGH_REM": "not enough REM sleep",
+    "NEGATIVE_SHORT_AND_POOR_QUALITY": "short and poor quality",
+    "NEGATIVE_POOR_STRUCTURE": "fragmented sleep",
+    "NEGATIVE_NOT_ENOUGH_DEEP": "not enough deep sleep",
+    "NEGATIVE_FRAGMENTED": "fragmented",
+    "POSITIVE_GOOD_QUALITY": "good quality",
+    "GENERAL_NEG_FAIR_OR_POOR_SLEEP": "fair to poor sleep",
+    # Adaptive coach status
+    "COMPLETED_TODAYS_WORKOUT": "completed today",
+    "COMPLETED_TODAY": "completed today",
+    "NOT_COMPLETE": "upcoming",
+    "COMPLETE": "done",
+    # Workout phrases
+    "MEDIUM_WEEK_LOAD_BASE": "medium-load base",
+    "HIGH_WEEK_LOAD_BASE": "high-load base",
+    "LOW_WEEK_LOAD_BASE": "low-load base",
+    # Readiness level
+    "VERY_GOOD": "very good",
+    "MODERATE": "moderate",
+    # Activity types
+    "INDOOR_CARDIO": "indoor cardio",
+    "INDOOR_CYCLING": "indoor cycling",
+    "TREADMILL_RUNNING": "treadmill running",
+    # Priority types
+    "REQUIRED": "required",
+    "OPTIONAL": "optional",
+    "SUGGESTED": "suggested",
+}
+
+# Tokens that look like enums but should NEVER be humanized.
+_HUMANIZE_SKIP = {
+    "HRV", "HRV7", "CTL", "ATL", "TSB", "ACWR", "RHR", "VDOT",
+    "REM", "SPO2", "SPO", "VO2", "GH", "CPAP", "OSA", "GP", "PR",
+    "HR", "BPM", "RPE", "KM", "M", "S", "H", "SD",
+    "BMW", "UTC", "GMT", "ISO", "DTO", "ID", "PDF", "HTML", "JSON", "API",
+    "MM", "DD", "YYYY",
+}
+
+# camelCase field names from Garmin's API that leak into text. Map to
+# plain English.
+CAMEL_CASE_HUMAN: dict[str, str] = {
+    "lastNightAvg": "last night",
+    "lastNight": "last night",
+    "weeklyAvg": "7-day average",
+    "balancedLow": "your personal healthy floor",
+    "balancedUpper": "your personal healthy ceiling",
+    "balancedHigh": "your personal healthy ceiling",
+    "dailyTrainingLoadAcute": "today's fatigue load",
+    "dailyTrainingLoadChronic": "today's fitness load",
+    "dailyAcuteChronicWorkloadRatio": "load strain ratio",
+    "maxTrainingLoadChronic": "maximum fitness load",
+    "minTrainingLoadChronic": "minimum fitness load",
+    "acuteTrainingLoadDTO": "training-load data",
+    "acwrStatus": "load status",
+    "acwrPercent": "load percent",
+    "restingHeartRate": "resting heart rate",
+    "lastSevenDaysAvgRestingHeartRate": "7-day average resting heart rate",
+    "sleepTimeSeconds": "sleep duration",
+    "deepSleepSeconds": "deep sleep",
+    "remSleepSeconds": "REM sleep",
+    "lightSleepSeconds": "light sleep",
+    "awakeSleepSeconds": "awake time",
+    "sleepScoreFeedback": "sleep feedback",
+    "sleepScore": "sleep score",
+    "trainingEffectLabel": "training effect",
+    "activityTrainingLoad": "session load",
+    "averageHR": "average heart rate",
+    "maxHR": "max heart rate",
+    "startTimeLocal": "start time",
+    "startTimeGMT": "start time",
+    "fitnessTrend": "fitness trend",
+    "weeklyTrainingLoad": "weekly training load",
+    "trainingStatus": "training status",
+    "trainingReadiness": "training readiness",
+    "recoveryTime": "recovery time",
+    "hrvSummary": "heart-rate-variability summary",
+    "hrvStatus": "heart-rate-variability status",
+    "trainingLoadBalance": "training-load balance",
+    "monthlyLoadAerobicLow": "monthly easy-aerobic load",
+    "monthlyLoadAerobicHigh": "monthly hard-aerobic load",
+    "monthlyLoadAnaerobic": "monthly anaerobic load",
+    "trainingBalanceFeedbackPhrase": "training-balance feedback",
+    "anaerobicTrainingEffect": "anaerobic benefit",
+    "aerobicTrainingEffect": "aerobic benefit",
+    "mostRecentVO2Max": "VO₂max",
+    "vo2MaxPreciseValue": "VO₂max",
+    "vo2MaxValue": "VO₂max",
+    "latestTrainingStatusData": "training status data",
+    "mostRecentTrainingStatus": "current training status",
+    "mostRecentTrainingLoadBalance": "current load balance",
+    "lowestSpO2Value": "overnight low blood oxygen",
+    "averageSpO2Value": "overnight average blood oxygen",
+    "highestSpO2Value": "overnight high blood oxygen",
+    "sleepScorePersonalizedInsight": "sleep insight",
+    "weeklyTrainingLoadAcute": "weekly acute load",
+    "acuteTrainingLoad": "recent load",
+    "chronicTrainingLoad": "sustained load",
+}
+
+_ENUM_RE = None
+_CAMEL_RE = None
+
+
+def humanize_garmin_text(text: str) -> str:
+    """Replace Garmin enums and camelCase field names with plain language.
+
+    Two passes:
+    1. ALL_CAPS_WITH_UNDERSCORES → known map or generic lowercase/space
+    2. camelCaseFieldNames → known map or generic space-separated
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    global _ENUM_RE, _CAMEL_RE
+    if _ENUM_RE is None:
+        import re
+        _ENUM_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
+        _CAMEL_RE = re.compile(r"\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b")
+
+    def enum_repl(m):
+        tok = m.group(0)
+        if tok in _HUMANIZE_SKIP:
+            return tok
+        if tok in GARMIN_ENUM_HUMAN:
+            return GARMIN_ENUM_HUMAN[tok]
+        if "_" in tok:
+            return tok.replace("_", " ").lower()
+        return tok
+
+    def camel_repl(m):
+        tok = m.group(0)
+        if tok in CAMEL_CASE_HUMAN:
+            return CAMEL_CASE_HUMAN[tok]
+        # Generic conversion: insert space before each uppercase letter then lowercase
+        import re as _re
+        out = _re.sub(r"([A-Z])", r" \1", tok).strip().lower()
+        return out
+
+    text = _ENUM_RE.sub(enum_repl, text)
+    text = _CAMEL_RE.sub(camel_repl, text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# KPI plain-language augmentation
+# ---------------------------------------------------------------------------
+
+def kpi_interpret(label: str, value: Any, status: str | None, trend: str | None) -> dict:
+    """Return a dict with plain-language label, subtitle, and a one-line
+    interpretation for a KPI based on its label and value."""
+    lab = str(label).strip()
+    low = lab.lower()
+    v = str(value).strip() if value is not None else ""
+    # Strip a leading "+" on standalone numerics. Plain positive numbers don't
+    # need a sign, and a leading "+" is a common upstream tell for Form (TSB)
+    # being written as "+N" when fatigue actually dominates (should be "-N").
+    # We only strip it — we never flip sign — so a genuine positive still reads
+    # correctly.
+    if v.startswith("+") and len(v) > 1 and v[1].isdigit():
+        v = v[1:]
+
+    # Defaults
+    out = {
+        "plain_label": lab,
+        "abbr": "",
+        "definition": "",
+        "value": v,
+        "unit": "",
+        "interpretation": "",
+        "status": (status or "").lower() if status else "",
+        "trend": trend or "",
+    }
+
+    if "acwr" in low or "strain" in low or "load strain" in low:
+        out.update(plain_label="Load Strain Ratio", abbr="ACWR", definition=gdef("ACWR"))
+        try:
+            f = float(v.split()[0])
+            if f < 0.8:
+                out["interpretation"] = "Below sweet spot — you've eased off; detraining risk if sustained."
+            elif f < 1.1:
+                out["interpretation"] = "Sweet spot — fitness growing sustainably."
+            elif f < 1.3:
+                out["interpretation"] = "Productive — building hard but not risky."
+            elif f < 1.5:
+                out["interpretation"] = "High — keep an eye on recovery signals."
+            else:
+                out["interpretation"] = "Overreach zone — injury/illness risk rising."
+        except Exception:
+            pass
+    elif low.startswith("ctl") or "fitness" == low or "chronic" in low:
+        out.update(plain_label="Fitness", abbr="CTL", definition=gdef("CTL"))
+        out["interpretation"] = "Your sustained training load. Rising = aerobic base is growing."
+    elif low.startswith("atl") or low == "fatigue":
+        out.update(plain_label="Fatigue", abbr="ATL", definition=gdef("ATL"))
+        out["interpretation"] = "How tired you are right now from recent work."
+    elif low.startswith("tsb") or "form" in low or "freshness" in low:
+        out.update(plain_label="Form", abbr="TSB", definition=gdef("TSB"))
+        try:
+            f = float(v.split()[0])
+            if f > 10:
+                out["interpretation"] = "Fresh and ready — race-day territory."
+            elif f > -20:
+                out["interpretation"] = "Lightly fatigued — sustainable training state."
+            elif f > -50:
+                out["interpretation"] = "Training-block fatigue — expected during a build."
+            else:
+                out["interpretation"] = "Deep fatigue — recover before adding more."
+        except Exception:
+            pass
+    elif "hrv" in low:
+        out.update(plain_label="Heart Rate Variability", abbr="HRV", definition=gdef("HRV"))
+        out["interpretation"] = "Autonomic recovery signal. Compare to your personal baseline."
+    elif "readiness" in low:
+        out.update(plain_label="Readiness", abbr="Readiness", definition=gdef("readiness"))
+        try:
+            numpart = v.split()[0]
+            f = float(numpart)
+            if f >= 75:
+                out["interpretation"] = "Fresh — a hard session is supported."
+            elif f >= 50:
+                out["interpretation"] = "Moderate — easy to moderate work is fine."
+            elif f >= 25:
+                out["interpretation"] = "Low — prioritize recovery over intensity."
+            else:
+                out["interpretation"] = "Very low — rest or very easy movement only."
+        except Exception:
+            pass
+    elif "rem" in low or "sleep" in low:
+        out.update(plain_label="Sleep Quality", abbr="", definition=gdef("REM"))
+        out["interpretation"] = "How your overnight recovery is trending."
+    elif "spo2" in low or "blood oxygen" in low or "nadir" in low:
+        out.update(plain_label="Blood Oxygen Pattern", abbr="SpO2", definition=gdef("SpO2"))
+        out["interpretation"] = "Nocturnal oxygen lows. Recurring drops below 88% warrant clinical check."
+    elif "vdot" in low or ("vo2" in low and "fitness" in low):
+        out.update(plain_label="Daniels Score", abbr="VDOT", definition=gdef("VDOT"))
+        out["interpretation"] = "Your current performance score driving training paces."
+    elif "long" in low and "run" in low:
+        out["plain_label"] = "Long Run Ceiling"
+        out["interpretation"] = "Your longest recent run. Must progress toward 32–35 km for a marathon."
+    elif "volume" in low or "weekly" in low:
+        out["plain_label"] = "Weekly Volume"
+        out["interpretation"] = "Training volume per week across all sports."
+    elif "adherence" in low:
+        out["plain_label"] = "Plan Adherence"
+        out["interpretation"] = "How closely you're executing prescribed sessions."
+    elif "easy" in low and ("drift" in low or "tempo" in low):
+        out["plain_label"] = "Easy-Run Discipline"
+        out["interpretation"] = "Fraction of 'easy' runs that drifted into tempo effort."
+    elif "threshold" in low and "pace" in low:
+        out["plain_label"] = "Threshold Pace"
+        out["interpretation"] = "Your current functional threshold running pace."
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# HTML helpers
+# ---------------------------------------------------------------------------
+
+def esc(x: Any) -> str:
+    return html.escape(str(x)) if x is not None else ""
+
+
+def esc_h(x: Any) -> str:
+    """Escape + humanize Garmin enums. Use for user-facing text content."""
+    if x is None:
+        return ""
+    return html.escape(humanize_garmin_text(str(x)))
+
+
+STATUS_COLORS = {
+    "green": "#22c55e",
+    "amber": "#f59e0b",
+    "yellow": "#f59e0b",
+    "red": "#ef4444",
+    "go": "#22c55e",
+    "caution": "#f59e0b",
+    "stop": "#ef4444",
+}
+
+
+def status_color(status: str | None) -> str:
+    if not status:
+        return "#64748b"
+    return STATUS_COLORS.get(status.lower().strip(), "#64748b")
+
+
+def traffic_light(text: str) -> tuple[str, str]:
+    """Parse the first word of a traffic-light prefixed string.
+    Returns (color_key, remaining_text)."""
+    t = (text or "").lstrip()
+    for kw in ("GREEN", "AMBER", "YELLOW", "RED"):
+        if t.upper().startswith(kw):
+            color = {"GREEN": "green", "AMBER": "amber", "YELLOW": "amber", "RED": "red"}[kw]
+            rest = t[len(kw):].lstrip(" —-:").strip()
+            return color, rest
+    return "", t
+
+
+def fmt_duration_sec(sec: float | int | None) -> str:
+    if sec is None or sec == 0:
+        return "0 min"
+    s = int(sec)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m} min"
+
+
+def fmt_km(m: float | int | None) -> str:
+    if m is None:
+        return "—"
+    try:
+        return f"{float(m) / 1000:.1f} km"
+    except Exception:
+        return "—"
+
+
+def fmt_iso_date(s: str | None) -> str:
+    if not s:
+        return ""
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d.strftime("%a %b %d, %Y %H:%M UTC")
+    except Exception:
+        return str(s)
+
+
+# ---------------------------------------------------------------------------
+# raw.json extractors
+# ---------------------------------------------------------------------------
+
+def extract_training_load_series(raw: dict) -> list[dict]:
+    """Return a list of {date, atl, ctl, tsb, acwr} dicts in chronological order."""
+    out: list[dict] = []
+    ts = raw.get("training_status") or {}
+    for d in sorted(ts.keys()):
+        entry = ts[d]
+        if not isinstance(entry, dict):
+            continue
+        try:
+            latest = entry.get("mostRecentTrainingStatus", {}).get("latestTrainingStatusData", {})
+            uk = next(iter(latest), None) if isinstance(latest, dict) else None
+            if not uk:
+                continue
+            node = latest[uk]
+            acute_dto = node.get("acuteTrainingLoadDTO", {}) if isinstance(node, dict) else {}
+            atl = acute_dto.get("dailyTrainingLoadAcute")
+            ctl = acute_dto.get("dailyTrainingLoadChronic")
+            acwr = acute_dto.get("dailyAcuteChronicWorkloadRatio")
+            tsb = None
+            if atl is not None and ctl is not None:
+                try:
+                    tsb = float(ctl) - float(atl)
+                except Exception:
+                    tsb = None
+            out.append({"date": d, "atl": atl, "ctl": ctl, "tsb": tsb, "acwr": acwr})
+        except Exception:
+            continue
+    return out
+
+
+def extract_hrv_series(raw: dict) -> list[dict]:
+    """Return [{date, last_night, weekly_avg, balanced_low, balanced_high}]."""
+    out: list[dict] = []
+    h = raw.get("hrv") or {}
+    for d in sorted(h.keys()):
+        entry = h[d]
+        if not isinstance(entry, dict):
+            continue
+        summary = entry.get("hrvSummary") or {}
+        ln = summary.get("lastNightAvg")
+        wa = summary.get("weeklyAvg")
+        baseline = summary.get("baseline") or {}
+        lo = baseline.get("balancedLow")
+        hi = baseline.get("balancedUpper")
+        out.append(
+            {
+                "date": d,
+                "last_night": ln,
+                "weekly_avg": wa,
+                "balanced_low": lo,
+                "balanced_high": hi,
+            }
+        )
+    return out
+
+
+def extract_sleep_series(raw: dict) -> list[dict]:
+    """Return [{date, total_sec, deep_sec, light_sec, rem_sec, awake_sec}]."""
+    out: list[dict] = []
+    s = raw.get("sleep") or {}
+    for d in sorted(s.keys()):
+        entry = s[d]
+        if not isinstance(entry, dict):
+            continue
+        dto = entry.get("dailySleepDTO") or {}
+        out.append(
+            {
+                "date": d,
+                "total_sec": dto.get("sleepTimeSeconds"),
+                "deep_sec": dto.get("deepSleepSeconds"),
+                "light_sec": dto.get("lightSleepSeconds"),
+                "rem_sec": dto.get("remSleepSeconds"),
+                "awake_sec": dto.get("awakeSleepSeconds"),
+            }
+        )
+    return out
+
+
+def extract_season_context(data: dict) -> dict | None:
+    """Build a race-roadmap timeline context from analysis.json's plan field.
+
+    Returns None when there are no races to plot. Otherwise returns a dict
+    with `today`, `start`, `end` (ISO date strings) and `races` (list of
+    {name, date, priority, target_time}).
+    """
+    import datetime as _dt
+    today_iso = (data.get("generated_at") or _dt.datetime.now(_dt.timezone.utc).isoformat())[:10]
+    races: list[dict] = []
+
+    pl = data.get("plan") or {}
+    anchor_date = pl.get("anchor_race_date") or pl.get("end")
+    anchor_name = pl.get("anchor_race_name") or pl.get("name", "Race")
+    anchor_target = pl.get("anchor_race_target")
+    if anchor_date:
+        races.append({
+            "name": anchor_name,
+            "date": anchor_date,
+            "priority": "A",
+            "target_time": anchor_target,
+        })
+    for r in (pl.get("races") or pl.get("additional_races") or []):
+        if not isinstance(r, dict) or not r.get("date"):
+            continue
+        if any(x["date"] == r["date"] and x["name"] == r.get("name") for x in races):
+            continue
+        races.append({
+            "name": r.get("name", "Race"),
+            "date": r["date"],
+            "priority": r.get("priority", ""),
+            "target_time": r.get("target_time"),
+        })
+
+    if not races:
+        return None
+
+    races = sorted(races, key=lambda r: r.get("date") or "")
+    return {
+        "today": today_iso,
+        "start": today_iso,
+        "end": races[-1]["date"],
+        "races": races,
+    }
+
+
+def chart_season_timeline(ctx: dict) -> str:
+    """Horizontal season roadmap: macro phases + today marker + race pins."""
+    if not ctx:
+        return ""
+    try:
+        start = date.fromisoformat(ctx["start"])
+        end = date.fromisoformat(ctx["end"])
+        today = date.fromisoformat(ctx["today"])
+    except Exception:
+        return ""
+    total_days = (end - start).days
+    if total_days <= 0:
+        return ""
+
+    # Timeline layout (scaled to CHART_W)
+    W = CHART_W
+    H = 280
+    pad_l = 20
+    pad_r = 20
+    pad_t = 30
+    pad_b = 110
+    bar_y = pad_t + 40
+    bar_h = 46
+    legend_y = bar_y + bar_h + 82
+
+    def x_for(d: date) -> float:
+        frac = (d - start).days / total_days
+        frac = max(0.0, min(1.0, frac))
+        return pad_l + frac * (W - pad_l - pad_r)
+
+    RACE_COLORS = {"A": "#ef4444", "B": "#f59e0b", "C": "#60a5fa"}
+
+    body = []
+
+    # Title bar (subtle gray backing for full timeline)
+    body.append(
+        f'<rect x="{pad_l}" y="{bar_y}" width="{W - pad_l - pad_r}" height="{bar_h}" '
+        f'fill="#e5e7eb" rx="6" />'
+    )
+
+    # Month labels along the axis (under the bar)
+    month_cursor = date(start.year, start.month, 1)
+    if month_cursor < start:
+        pass
+    # Walk through months from start to end
+    d = date(start.year, start.month, 1)
+    while d <= end:
+        if d >= start:
+            x = x_for(d)
+            body.append(
+                f'<line x1="{x:.1f}" y1="{bar_y + bar_h}" x2="{x:.1f}" '
+                f'y2="{bar_y + bar_h + 6}" stroke="#4b5563" stroke-width="1" />'
+            )
+            mlabel = d.strftime("%b")
+            body.append(
+                f'<text x="{x:.1f}" y="{bar_y + bar_h + 20:.1f}" text-anchor="start" '
+                f'font-size="10" fill="#9ca3af">{mlabel}</text>'
+            )
+        # Next month
+        if d.month == 12:
+            d = date(d.year + 1, 1, 1)
+        else:
+            d = date(d.year, d.month + 1, 1)
+
+    # Race priority legend (right side only).
+    present_prios = []
+    for r in ctx["races"]:
+        p = (r.get("priority") or "C").upper()
+        if p not in RACE_COLORS:
+            p = "C"
+        if p not in present_prios:
+            present_prios.append(p)
+    present_prios.sort()
+    if present_prios:
+        rx_cursor = W - pad_r
+        for p in reversed(present_prios):
+            label_txt = f"{p} race"
+            rx_cursor -= len(label_txt) * 7
+            body.append(
+                f'<text x="{rx_cursor:.1f}" y="{legend_y + 1:.1f}" font-size="11" '
+                f'fill="#e5e7eb">{esc(label_txt)}</text>'
+            )
+            rx_cursor -= 8
+            body.append(
+                f'<circle cx="{rx_cursor:.1f}" cy="{legend_y - 3:.1f}" r="5" '
+                f'fill="{RACE_COLORS[p]}" stroke="#0b0f17" stroke-width="1.5" />'
+            )
+            rx_cursor -= 12
+
+    # Race pins
+    for r in ctx["races"]:
+        try:
+            rd = date.fromisoformat(r["date"])
+        except Exception:
+            continue
+        if rd < start or rd > end:
+            continue
+        rx = x_for(rd)
+        priority = (r.get("priority") or "C").upper()
+        if priority not in RACE_COLORS:
+            priority = "C"
+        pin_color = RACE_COLORS[priority]
+        # Vertical line through the bar
+        body.append(
+            f'<line x1="{rx:.1f}" y1="{bar_y - 8}" x2="{rx:.1f}" '
+            f'y2="{bar_y + bar_h + 2}" stroke="{pin_color}" stroke-width="2" stroke-dasharray="3 2" />'
+        )
+        # Pin circle above
+        body.append(
+            f'<circle cx="{rx:.1f}" cy="{bar_y - 12}" r="5" fill="{pin_color}" stroke="#0b0f17" stroke-width="1.5"/>'
+        )
+        # Label group — rotate ~35° for readability
+        name = r.get("name", "")
+        if len(name) > 18:
+            name = name[:17] + "…"
+        target = r.get("target_time") or ""
+        label = name
+        if target:
+            label = f"{name} · target {target}"
+        weeks_out = max(0, (rd - today).days) // 7
+        weeks_suffix = f" ({weeks_out}w away)" if weeks_out > 0 else " (today!)" if weeks_out == 0 else ""
+        body.append(
+            f'<text x="{rx:.1f}" y="{pad_t - 4:.1f}" text-anchor="middle" '
+            f'font-size="11" font-weight="600" fill="{pin_color}">'
+            f'{esc(priority + " race: ")}{esc(name)}'
+            f'</text>'
+        )
+        # Date + weeks-out label below pin label
+        body.append(
+            f'<text x="{rx:.1f}" y="{pad_t + 10:.1f}" text-anchor="middle" '
+            f'font-size="10" fill="#9ca3af">'
+            f'{esc(rd.strftime("%b %d"))}{esc(weeks_suffix)}'
+            f'</text>'
+        )
+
+    # Today marker (drawn last so it's on top)
+    if start <= today <= end:
+        tx = x_for(today)
+        body.append(
+            f'<line x1="{tx:.1f}" y1="{bar_y - 22}" x2="{tx:.1f}" '
+            f'y2="{bar_y + bar_h + 8}" stroke="#e5e7eb" stroke-width="2.5" />'
+        )
+        body.append(
+            f'<polygon points="{tx-6:.1f},{bar_y - 22:.1f} {tx+6:.1f},{bar_y - 22:.1f} {tx:.1f},{bar_y - 12:.1f}" '
+            f'fill="#e5e7eb"/>'
+        )
+        body.append(
+            f'<text x="{tx:.1f}" y="{bar_y + bar_h + 50:.1f}" text-anchor="middle" '
+            f'font-size="11" font-weight="700" fill="#e5e7eb">TODAY</text>'
+        )
+        body.append(
+            f'<text x="{tx:.1f}" y="{bar_y + bar_h + 63:.1f}" text-anchor="middle" '
+            f'font-size="10" fill="#9ca3af">{esc(today.strftime("%a %b %d"))}</text>'
+        )
+
+    return (
+        f'<svg viewBox="0 0 {W} {H}" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="Season roadmap timeline">'
+        + "".join(body)
+        + "</svg>"
+    )
+
+
+def extract_weekly_volume_by_sport(raw: dict, metrics: dict | None) -> list[dict]:
+    """Aggregate activities into weekly per-sport volume (km + sessions).
+
+    Prefers `training-metrics.json`'s `weekly[]` rollup when available, since
+    that's the same sport-agnostic aggregation the experts read. Falls back to
+    summing `raw.json.activities[]` directly for back-compat with old runs.
+
+    Returns [{week_start, week_end, by_sport: {sport: {km, sessions}}, sessions}].
+    Distance is included for sports where it's meaningful (running, cycling,
+    hiking, walking, swimming); strength / mobility report sessions only.
+    """
+    # Preferred path: training-metrics.json
+    if metrics:
+        weekly = metrics.get("weekly") or []
+        out = []
+        for wk in weekly:
+            if not isinstance(wk, dict):
+                continue
+            bys_in = wk.get("by_sport") or {}
+            bys_out = {}
+            total_sessions = 0
+            for sport, vals in bys_in.items():
+                if not isinstance(vals, dict):
+                    continue
+                bys_out[sport] = {
+                    "km": float(vals.get("distance_km") or 0),
+                    "sessions": int(vals.get("sessions") or 0),
+                    "duration_min": float(vals.get("duration_min") or 0),
+                }
+                total_sessions += bys_out[sport]["sessions"]
+            out.append(
+                {
+                    "week_start": wk.get("week_start"),
+                    "week_end": wk.get("week_end"),
+                    "by_sport": bys_out,
+                    "sessions": total_sessions,
+                }
+            )
+        return out
+
+    # Fallback: aggregate from raw.json activities directly (older runs).
+    acts = raw.get("activities") or []
+    by_week: dict[str, dict] = {}
+    for a in acts:
+        if not isinstance(a, dict):
+            continue
+        at = a.get("activityType")
+        tkey = at.get("typeKey") if isinstance(at, dict) else ""
+        sport = _sport_bucket(tkey)
+        raw_dt = a.get("startTimeLocal") or a.get("startTimeGMT") or ""
+        if not isinstance(raw_dt, str) or len(raw_dt) < 10:
+            continue
+        try:
+            d = date.fromisoformat(raw_dt[:10])
+        except Exception:
+            continue
+        monday = d - timedelta(days=d.weekday())
+        key = monday.isoformat()
+        bucket = by_week.setdefault(
+            key,
+            {
+                "week_start": monday.isoformat(),
+                "week_end": (monday + timedelta(days=6)).isoformat(),
+                "by_sport": {},
+                "sessions": 0,
+            },
+        )
+        sbucket = bucket["by_sport"].setdefault(
+            sport, {"km": 0.0, "sessions": 0, "duration_min": 0.0}
+        )
+        try:
+            sbucket["km"] += float(a.get("distance") or 0) / 1000.0
+        except Exception:
+            pass
+        try:
+            sbucket["duration_min"] += float(a.get("duration") or 0) / 60.0
+        except Exception:
+            pass
+        sbucket["sessions"] += 1
+        bucket["sessions"] += 1
+    return [by_week[k] for k in sorted(by_week.keys())]
+
+
+def find_today_activity(raw: dict, today_iso: str) -> dict | None:
+    """Return the activity (if any) logged today in raw.json."""
+    acts = raw.get("activities") or []
+    best = None
+    for a in acts:
+        if not isinstance(a, dict):
+            continue
+        dt = a.get("startTimeLocal") or a.get("startTimeGMT") or ""
+        if isinstance(dt, str) and dt[:10] == today_iso:
+            # Prefer the latest one of the day
+            if best is None or (a.get("startTimeLocal", "") > best.get("startTimeLocal", "")):
+                best = a
+    return best
+
+
+# ---------------------------------------------------------------------------
+# SVG chart helpers (pure inline SVG, no JS)
+# ---------------------------------------------------------------------------
+
+CHART_W = 900
+CHART_H = 280
+CHART_PAD_L = 50
+CHART_PAD_R = 20
+CHART_PAD_T = 20
+CHART_PAD_B = 40
+
+
+def _svg_scale_x(i: int, n: int) -> float:
+    if n <= 1:
+        return CHART_PAD_L
+    usable = CHART_W - CHART_PAD_L - CHART_PAD_R
+    return CHART_PAD_L + (i / (n - 1)) * usable
+
+
+def _svg_scale_y(v: float, vmin: float, vmax: float) -> float:
+    if vmax <= vmin:
+        return CHART_H - CHART_PAD_B
+    usable = CHART_H - CHART_PAD_T - CHART_PAD_B
+    t = (v - vmin) / (vmax - vmin)
+    return CHART_PAD_T + (1 - t) * usable
+
+
+def _svg_axis(vmin: float, vmax: float, y_label: str, dates: list[str]) -> str:
+    """Draw X/Y axes with 4-5 gridlines and tick labels."""
+    out = []
+    # Y gridlines
+    steps = 4
+    for i in range(steps + 1):
+        v = vmin + (vmax - vmin) * (i / steps)
+        y = _svg_scale_y(v, vmin, vmax)
+        out.append(
+            f'<line x1="{CHART_PAD_L}" y1="{y:.1f}" x2="{CHART_W - CHART_PAD_R}" y2="{y:.1f}" '
+            f'stroke="#e5e7eb" stroke-width="1" />'
+        )
+        out.append(
+            f'<text x="{CHART_PAD_L - 8}" y="{y + 4:.1f}" text-anchor="end" '
+            f'font-size="11" fill="#9ca3af">{v:.0f}</text>'
+        )
+    # Y label
+    out.append(
+        f'<text x="12" y="{CHART_H / 2:.0f}" text-anchor="middle" '
+        f'font-size="11" fill="#9ca3af" transform="rotate(-90 12 {CHART_H / 2:.0f})">{esc(y_label)}</text>'
+    )
+    # X ticks — show ~5 evenly spaced labels
+    n = len(dates)
+    if n > 0:
+        tick_idx = [0, n // 4, n // 2, 3 * n // 4, n - 1] if n >= 5 else list(range(n))
+        tick_idx = sorted(set(tick_idx))
+        for i in tick_idx:
+            x = _svg_scale_x(i, n)
+            out.append(
+                f'<line x1="{x:.1f}" y1="{CHART_H - CHART_PAD_B}" x2="{x:.1f}" '
+                f'y2="{CHART_H - CHART_PAD_B + 4}" stroke="#4b5563" stroke-width="1" />'
+            )
+            d = dates[i]
+            short = d[5:] if len(d) >= 10 else d  # MM-DD
+            out.append(
+                f'<text x="{x:.1f}" y="{CHART_H - CHART_PAD_B + 18}" text-anchor="middle" '
+                f'font-size="10" fill="#9ca3af">{esc(short)}</text>'
+            )
+    return "".join(out)
+
+
+def _svg_line(points: list[tuple[float, float]], color: str, width: float = 2.0, label: str = "") -> str:
+    if not points:
+        return ""
+    pts_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in points if not (math.isnan(y) or math.isinf(y)))
+    if not pts_str:
+        return ""
+    title = f'<title>{esc(label)}</title>' if label else ""
+    return (
+        f'<polyline fill="none" stroke="{color}" stroke-width="{width}" '
+        f'stroke-linejoin="round" stroke-linecap="round" points="{pts_str}">{title}</polyline>'
+    )
+
+
+def _svg_line_segments(
+    series: list[tuple[float, float | None]],
+    color: str,
+    width: float = 2.0,
+) -> str:
+    """Draw a line that breaks around None values."""
+    out = []
+    current: list[tuple[float, float]] = []
+    for x, y in series:
+        if y is None:
+            if len(current) >= 2:
+                out.append(_svg_line(current, color, width))
+            current = []
+        else:
+            current.append((x, y))
+    if len(current) >= 2:
+        out.append(_svg_line(current, color, width))
+    return "".join(out)
+
+
+def _svg_band(
+    series_low: list[tuple[float, float | None]],
+    series_high: list[tuple[float, float | None]],
+    color: str,
+    opacity: float = 0.15,
+) -> str:
+    """Shaded band between two lines (assumes same x values)."""
+    if len(series_low) != len(series_high):
+        return ""
+    pts_low = [(x, y) for x, y in series_low if y is not None]
+    pts_high = [(x, y) for x, y in series_high if y is not None]
+    if len(pts_low) < 2 or len(pts_high) < 2:
+        return ""
+    poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts_high)
+    poly += " " + " ".join(f"{x:.1f},{y:.1f}" for x, y in reversed(pts_low))
+    return f'<polygon fill="{color}" fill-opacity="{opacity}" points="{poly}" />'
+
+
+def chart_training_load(series: list[dict]) -> str:
+    """Build the training load timeline chart (CTL, ATL, TSB)."""
+    pts = [s for s in series if s["atl"] is not None and s["ctl"] is not None]
+    if len(pts) < 3:
+        return ""
+    dates = [s["date"] for s in pts]
+    atls = [float(s["atl"]) for s in pts]
+    ctls = [float(s["ctl"]) for s in pts]
+    tsbs = [float(s["tsb"]) if s["tsb"] is not None else None for s in pts]
+
+    all_vals = [v for v in atls + ctls + [t for t in tsbs if t is not None] if v is not None]
+    if not all_vals:
+        return ""
+    vmin = min(all_vals) - 20
+    vmax = max(all_vals) + 20
+
+    n = len(dates)
+    x_coords = [_svg_scale_x(i, n) for i in range(n)]
+
+    atl_series = [(x_coords[i], _svg_scale_y(atls[i], vmin, vmax)) for i in range(n)]
+    ctl_series = [(x_coords[i], _svg_scale_y(ctls[i], vmin, vmax)) for i in range(n)]
+    tsb_series = [
+        (x_coords[i], _svg_scale_y(tsbs[i], vmin, vmax) if tsbs[i] is not None else None)
+        for i in range(n)
+    ]
+
+    # Zero line for TSB
+    zero_y = _svg_scale_y(0, vmin, vmax) if vmin <= 0 <= vmax else None
+
+    body = []
+    body.append(_svg_axis(vmin, vmax, "Load", dates))
+    if zero_y is not None:
+        body.append(
+            f'<line x1="{CHART_PAD_L}" y1="{zero_y:.1f}" x2="{CHART_W - CHART_PAD_R}" '
+            f'y2="{zero_y:.1f}" stroke="#4b5563" stroke-width="1" stroke-dasharray="4 4" />'
+        )
+    body.append(_svg_line(ctl_series, "#14b8a6", 2.5, f"Fitness (CTL) on {dates[-1]}: {ctls[-1]:.0f}"))
+    body.append(_svg_line(atl_series, "#f59e0b", 2.0, f"Fatigue (ATL) on {dates[-1]}: {atls[-1]:.0f}"))
+    body.append(_svg_line_segments(tsb_series, "#a78bfa", 1.5))
+
+    legend = (
+        f'<g transform="translate({CHART_PAD_L + 10}, {CHART_PAD_T + 6})">'
+        f'<rect x="0" y="-10" width="14" height="3" fill="#14b8a6"/><text x="20" y="-5" font-size="11" fill="#e5e7eb">Fitness</text>'
+        f'<rect x="85" y="-10" width="14" height="3" fill="#f59e0b"/><text x="105" y="-5" font-size="11" fill="#e5e7eb">Fatigue</text>'
+        f'<rect x="170" y="-10" width="14" height="3" fill="#a78bfa"/><text x="190" y="-5" font-size="11" fill="#e5e7eb">Form (fitness − fatigue)</text>'
+        f'</g>'
+    )
+    body.append(legend)
+
+    return (
+        f'<svg viewBox="0 0 {CHART_W} {CHART_H}" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="Training load timeline">'
+        + "".join(body)
+        + "</svg>"
+    )
+
+
+def chart_hrv(series: list[dict]) -> str:
+    """HRV timeline with personal baseline band."""
+    pts = [s for s in series if s["last_night"] is not None]
+    if len(pts) < 3:
+        return ""
+    dates = [s["date"] for s in pts]
+    ln = [float(s["last_night"]) for s in pts]
+    wa = [float(s["weekly_avg"]) if s["weekly_avg"] is not None else None for s in pts]
+    lo = [float(s["balanced_low"]) if s["balanced_low"] is not None else None for s in pts]
+    hi = [float(s["balanced_high"]) if s["balanced_high"] is not None else None for s in pts]
+
+    all_vals = [v for v in ln + [x for x in wa + lo + hi if x is not None]]
+    if not all_vals:
+        return ""
+    vmin = max(0, min(all_vals) - 5)
+    vmax = max(all_vals) + 5
+
+    n = len(dates)
+    x_coords = [_svg_scale_x(i, n) for i in range(n)]
+    ln_series = [(x_coords[i], _svg_scale_y(ln[i], vmin, vmax)) for i in range(n)]
+    wa_series = [
+        (x_coords[i], _svg_scale_y(wa[i], vmin, vmax) if wa[i] is not None else None) for i in range(n)
+    ]
+    lo_series = [
+        (x_coords[i], _svg_scale_y(lo[i], vmin, vmax) if lo[i] is not None else None) for i in range(n)
+    ]
+    hi_series = [
+        (x_coords[i], _svg_scale_y(hi[i], vmin, vmax) if hi[i] is not None else None) for i in range(n)
+    ]
+
+    body = []
+    body.append(_svg_axis(vmin, vmax, "HRV (ms)", dates))
+    # Personal balanced range: neutral gray band so it's clearly
+    # context, not a semantic signal competing with the lines.
+    body.append(_svg_band(lo_series, hi_series, "#64748b", 0.18))
+    body.append(_svg_line_segments(lo_series, "#94a3b8", 0.8))
+    body.append(_svg_line_segments(hi_series, "#94a3b8", 0.8))
+    # Weekly average: soft lavender smoothed trend
+    body.append(_svg_line_segments(wa_series, "#c4b5fd", 1.5))
+    # Last night: bright sky blue — the single primary signal
+    body.append(_svg_line(ln_series, "#38bdf8", 2.5, f"Last night on {dates[-1]}: {ln[-1]:.0f} ms"))
+
+    legend = (
+        f'<g transform="translate({CHART_PAD_L + 10}, {CHART_PAD_T + 6})">'
+        f'<rect x="0" y="-10" width="14" height="3" fill="#38bdf8"/><text x="20" y="-5" font-size="11" fill="#e5e7eb">Last night</text>'
+        f'<rect x="100" y="-10" width="14" height="3" fill="#c4b5fd"/><text x="120" y="-5" font-size="11" fill="#e5e7eb">7-day average</text>'
+        f'<rect x="205" y="-10" width="14" height="6" fill="#64748b" fill-opacity="0.35"/><text x="225" y="-5" font-size="11" fill="#e5e7eb">Your personal healthy range</text>'
+        f'</g>'
+    )
+    body.append(legend)
+
+    return (
+        f'<svg viewBox="0 0 {CHART_W} {CHART_H}" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="Heart rate variability timeline">'
+        + "".join(body)
+        + "</svg>"
+    )
+
+
+def chart_sleep(series: list[dict]) -> str:
+    """Sleep duration per night as stacked bars (deep/light/REM/awake)."""
+    pts = [s for s in series if s["total_sec"]]
+    if len(pts) < 3:
+        return ""
+    dates = [s["date"] for s in pts]
+    totals_h = [float(s["total_sec"] or 0) / 3600 for s in pts]
+
+    vmax = max(12, max(totals_h) + 1)
+    vmin = 0
+
+    n = len(dates)
+    bar_w = max(3, (CHART_W - CHART_PAD_L - CHART_PAD_R) / n * 0.8)
+
+    body = []
+    body.append(_svg_axis(vmin, vmax, "Hours", dates))
+
+    # 6h floor line
+    y6 = _svg_scale_y(6, vmin, vmax)
+    body.append(
+        f'<line x1="{CHART_PAD_L}" y1="{y6:.1f}" x2="{CHART_W - CHART_PAD_R}" y2="{y6:.1f}" '
+        f'stroke="#ef4444" stroke-width="1" stroke-dasharray="4 4" />'
+        f'<text x="{CHART_W - CHART_PAD_R - 4}" y="{y6 - 4:.1f}" text-anchor="end" font-size="10" fill="#ef4444">6h minimum</text>'
+    )
+    # 8h optimal
+    y8 = _svg_scale_y(8, vmin, vmax)
+    body.append(
+        f'<line x1="{CHART_PAD_L}" y1="{y8:.1f}" x2="{CHART_W - CHART_PAD_R}" y2="{y8:.1f}" '
+        f'stroke="#22c55e" stroke-width="1" stroke-dasharray="4 4" />'
+        f'<text x="{CHART_W - CHART_PAD_R - 4}" y="{y8 - 4:.1f}" text-anchor="end" font-size="10" fill="#22c55e">8h target</text>'
+    )
+
+    for i, p in enumerate(pts):
+        x = _svg_scale_x(i, n) - bar_w / 2
+        # Stack: deep at bottom, light, REM, awake on top
+        parts = [
+            ("deep_sec", "#2563eb", "Deep"),
+            ("light_sec", "#60a5fa", "Light"),
+            ("rem_sec", "#a78bfa", "REM"),
+            ("awake_sec", "#4b5563", "Awake"),
+        ]
+        y_cursor = _svg_scale_y(0, vmin, vmax)
+        cumulative_h = 0.0
+        title_parts = [f"{p['date']} total: {totals_h[i]:.1f}h"]
+        for key, color, name in parts:
+            sec = p.get(key) or 0
+            try:
+                hrs = float(sec) / 3600.0
+            except Exception:
+                hrs = 0.0
+            if hrs <= 0:
+                continue
+            cumulative_h += hrs
+            top_y = _svg_scale_y(cumulative_h, vmin, vmax)
+            height = y_cursor - top_y
+            body.append(
+                f'<rect x="{x:.1f}" y="{top_y:.1f}" width="{bar_w:.1f}" height="{height:.1f}" '
+                f'fill="{color}" />'
+            )
+            title_parts.append(f"{name}: {hrs:.1f}h")
+            y_cursor = top_y
+        # Title for hover
+        full_title = " / ".join(title_parts)
+        body.append(
+            f'<rect x="{x:.1f}" y="{_svg_scale_y(cumulative_h, vmin, vmax):.1f}" '
+            f'width="{bar_w:.1f}" height="{_svg_scale_y(0, vmin, vmax) - _svg_scale_y(cumulative_h, vmin, vmax):.1f}" '
+            f'fill="transparent"><title>{esc(full_title)}</title></rect>'
+        )
+
+    legend = (
+        f'<g transform="translate({CHART_PAD_L + 10}, {CHART_PAD_T + 6})">'
+        f'<rect x="0" y="-10" width="10" height="10" fill="#2563eb"/><text x="16" y="-1" font-size="11" fill="#e5e7eb">Deep</text>'
+        f'<rect x="65" y="-10" width="10" height="10" fill="#60a5fa"/><text x="81" y="-1" font-size="11" fill="#e5e7eb">Light</text>'
+        f'<rect x="130" y="-10" width="10" height="10" fill="#a78bfa"/><text x="146" y="-1" font-size="11" fill="#e5e7eb">REM</text>'
+        f'<rect x="195" y="-10" width="10" height="10" fill="#4b5563"/><text x="211" y="-1" font-size="11" fill="#e5e7eb">Awake</text>'
+        f'</g>'
+    )
+    body.append(legend)
+
+    return (
+        f'<svg viewBox="0 0 {CHART_W} {CHART_H}" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="Nightly sleep duration">'
+        + "".join(body)
+        + "</svg>"
+    )
+
+
+def chart_weekly_volume(weeks: list[dict]) -> str:
+    """Weekly training volume — stacked per sport.
+
+    Each week's bar stacks km from every distance-bearing sport (running,
+    cycling, hiking, walking, swimming). Strength / mobility / etc. are
+    session-only and appear in the hover tooltip; they don't have km to
+    stack. A small chip above the bar reports total non-distance sessions
+    so cross-training is visible at a glance.
+    """
+    if len(weeks) < 2:
+        return ""
+
+    # Per-week stack data
+    stacks: list[list[tuple[str, float]]] = []
+    tooltips: list[str] = []
+    sessions_only_counts: list[int] = []
+    week_totals_km: list[float] = []
+    sports_used: set[str] = set()
+
+    for w in weeks:
+        bys = w.get("by_sport") or {}
+        # Distance-bearing sports stacked in fixed bucket order
+        layers: list[tuple[str, float]] = []
+        for sport in _SPORT_BUCKETS:
+            if sport not in DISTANCE_SPORTS:
+                continue
+            v = bys.get(sport)
+            if not v:
+                continue
+            km = float(v.get("km") or 0)
+            if km > 0:
+                layers.append((sport, km))
+                sports_used.add(sport)
+        stacks.append(layers)
+        week_totals_km.append(sum(km for _, km in layers))
+
+        # Session-only sports: count strength/mobility/rowing/etc. for the chip.
+        sess_only = 0
+        sess_only_parts = []
+        for sport, vals in bys.items():
+            if sport in DISTANCE_SPORTS:
+                continue
+            if not isinstance(vals, dict):
+                continue
+            n = int(vals.get("sessions") or 0)
+            if n > 0:
+                sess_only += n
+                sess_only_parts.append(f"{n} {sport.replace('_', ' ')}")
+                sports_used.add(sport)
+        sessions_only_counts.append(sess_only)
+
+        # Tooltip: detailed sport breakdown
+        tooltip_parts = [f"Week of {w['week_start']}"]
+        for sport, km in layers:
+            n = int((bys.get(sport) or {}).get("sessions") or 0)
+            tooltip_parts.append(f"  {sport.replace('_', ' ')}: {km:.1f} km / {n} sessions")
+        for part in sess_only_parts:
+            tooltip_parts.append(f"  {part}")
+        tooltips.append("\n".join(tooltip_parts))
+
+    labels = [w["week_start"][5:] for w in weeks]  # MM-DD
+    vmax = max(week_totals_km + [0]) * 1.2 + 5
+    vmin = 0
+    n = len(weeks)
+    bar_w = max(10, (CHART_W - CHART_PAD_L - CHART_PAD_R) / n * 0.7)
+
+    body = []
+    body.append(_svg_axis(vmin, vmax, "km / week", labels))
+
+    for i, w in enumerate(weeks):
+        x = _svg_scale_x(i, n) - bar_w / 2
+        y_baseline = _svg_scale_y(0, vmin, vmax)
+        running_y = y_baseline  # bottom of the next layer to draw
+        for sport, km in stacks[i]:
+            layer_height = y_baseline - _svg_scale_y(km, vmin, vmax)
+            seg_top = running_y - layer_height
+            body.append(
+                f'<rect x="{x:.1f}" y="{seg_top:.1f}" width="{bar_w:.1f}" '
+                f'height="{layer_height:.1f}" fill="{_SPORT_COLORS.get(sport, "#9ca3af")}" rx="2">'
+                f'<title>{esc(tooltips[i])}</title></rect>'
+            )
+            running_y = seg_top
+
+        # Total km label above bar (running total of distance-bearing sports)
+        total_km = week_totals_km[i]
+        if total_km > 0:
+            top_y = _svg_scale_y(total_km, vmin, vmax)
+            body.append(
+                f'<text x="{x + bar_w / 2:.1f}" y="{top_y - 4:.1f}" text-anchor="middle" '
+                f'font-size="10" fill="#e5e7eb">{total_km:.0f}</text>'
+            )
+
+        # Cross-training chip for session-only sports (strength, mobility, etc.)
+        sess_only = sessions_only_counts[i]
+        if sess_only > 0:
+            chip_y = _svg_scale_y(0, vmin, vmax) - 1
+            body.append(
+                f'<text x="{x + bar_w / 2:.1f}" y="{chip_y + 12:.1f}" text-anchor="middle" '
+                f'font-size="9" fill="#475569">+{sess_only}x</text>'
+            )
+
+    # Legend across the top — only sports that actually appear in the window.
+    legend_items = []
+    lx = CHART_PAD_L
+    legend_y = CHART_PAD_T - 8
+    if legend_y < 14:
+        legend_y = 14
+    for sport in _SPORT_BUCKETS:
+        if sport not in sports_used:
+            continue
+        color = _SPORT_COLORS.get(sport, "#9ca3af")
+        label = sport.replace("_", " ")
+        legend_items.append(
+            f'<rect x="{lx:.1f}" y="{legend_y - 8:.1f}" width="10" height="10" fill="{color}" rx="2"/>'
+            f'<text x="{lx + 14:.1f}" y="{legend_y + 1:.1f}" font-size="10" fill="#475569">{esc(label)}</text>'
+        )
+        lx += 14 + 10 + len(label) * 6 + 14
+
+    return (
+        f'<svg viewBox="0 0 {CHART_W} {CHART_H}" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="Weekly training volume by sport">'
+        + "".join(legend_items)
+        + "".join(body)
+        + "</svg>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section renderers
+# ---------------------------------------------------------------------------
+
+def render_today_panel(data: dict, raw: dict | None) -> str:
+    """Hero panel: traffic light + today's session + primary call-to-action."""
+    experts = data.get("experts") or {}
+    phys = experts.get("physiology") or {}
+    weekly_text = phys.get("for_weekly_planner") or phys.get("for_synthesis") or ""
+    color_key, _ = traffic_light(weekly_text)
+    if not color_key:
+        kpis = data.get("kpis") or []
+        statuses = [(k.get("status") or "").lower() for k in kpis if isinstance(k, dict)]
+        if "red" in statuses:
+            color_key = "red"
+        elif "amber" in statuses or "yellow" in statuses:
+            color_key = "amber"
+        else:
+            color_key = "green"
+
+    color = status_color(color_key)
+    light_label = {"green": "GO", "amber": "CAUTION", "red": "HOLD"}.get(color_key, "—")
+
+    today_session_html = ""
+    if raw:
+        today_iso = (data.get("generated_at") or datetime.now(timezone.utc).isoformat())[:10]
+        session = find_today_activity(raw, today_iso)
+        if session:
+            raw_name = session.get("activityName") or session.get("activityType", {}).get("typeKey", "session")
+            # Humanize FIRST, then title-case — don't title-case a raw enum
+            # like LACTATE_THRESHOLD because that produces "Lactate_Threshold"
+            # which the humanizer won't match.
+            name = esc(humanize_garmin_text(raw_name).title() if raw_name else "")
+            raw_effect = session.get("trainingEffectLabel") or ""
+            effect = esc(humanize_garmin_text(raw_effect).title() if raw_effect else "")
+            dur = fmt_duration_sec(session.get("duration"))
+            dist = fmt_km(session.get("distance"))
+            hr = session.get("averageHR")
+            hr_part = f' · {int(hr)} bpm avg' if hr else ""
+            today_session_html = (
+                f'<div class="today-session">'
+                f'<div class="done">✓ Today&#39;s session — done</div>'
+                f'<div class="session-name">{name}</div>'
+                f'<div class="session-meta">{effect} · {dur} · {dist}{hr_part}</div>'
+                f'</div>'
+            )
+        else:
+            today_session_html = (
+                f'<div class="today-session no-session">'
+                f'<div class="done muted">No session logged today yet</div>'
+                f'</div>'
+            )
+
+    # Primary call to action: today recommendation (short form if available)
+    recs = data.get("recommendations") or []
+    today_rec = next((r for r in recs if isinstance(r, dict) and (r.get("horizon") or "").lower() == "today"), None)
+    rec_html = ""
+    if today_rec:
+        text = today_rec.get("text_short") or today_rec.get("text", "")
+        rec_html = (
+            f'<div class="cta">'
+            f'<div class="cta-label">What to do next</div>'
+            f'<div class="cta-text">{esc_h(text)}</div>'
+            f'</div>'
+        )
+
+    return f"""
+    <section class="today-panel" id="today">
+      <div class="light" style="background:{color}">
+        <div class="light-label">{light_label}</div>
+        <div class="light-sub">Readiness</div>
+      </div>
+      <div class="today-content">
+        {today_session_html}
+        {rec_html}
+      </div>
+    </section>
+    """
+
+
+def render_kpis(kpis: list[dict]) -> str:
+    if not kpis:
+        return "<p class='empty'>No key numbers reported.</p>"
+    cards = []
+    for k in kpis:
+        if not isinstance(k, dict):
+            continue
+        info = kpi_interpret(
+            label=k.get("label", ""),
+            value=k.get("value", ""),
+            status=k.get("status"),
+            trend=k.get("trend"),
+        )
+        # Prefer explicit fields from the analysis.json when present
+        if k.get("label"):
+            info["plain_label"] = k["label"]
+        if k.get("abbr"):
+            info["abbr"] = k["abbr"]
+        note = esc_h(k.get("note", ""))
+        source = esc_h(k.get("source", ""))
+        status_class = f"status-{info['status']}" if info["status"] else ""
+        trend_arrow = ""
+        if info["trend"]:
+            t = info["trend"].lower()
+            if "ris" in t:
+                trend_arrow = "↗"
+            elif "fall" in t:
+                trend_arrow = "↘"
+            elif "stead" in t:
+                trend_arrow = "→"
+
+        abbr_badge = ""
+        if info["abbr"] and info["abbr"] != info["plain_label"]:
+            # CSS-based tooltip (browser `title` attr is unreliable on some platforms)
+            defn = info.get("definition", "") or gdef(info["abbr"])
+            if defn:
+                abbr_badge = (
+                    f'<span class="tip" tabindex="0">{esc(info["abbr"])}'
+                    f'<span class="tip-body">{esc(defn)}</span></span>'
+                )
+            else:
+                abbr_badge = f'<span class="abbr-plain">{esc(info["abbr"])}</span>'
+
+        interp = esc_h(info['interpretation']) if info['interpretation'] else note
+        cards.append(
+            f"""
+            <div class="kpi {status_class}">
+              <div class="kpi-head">
+                <div class="kpi-label">
+                  {esc_h(info['plain_label'])}
+                  {abbr_badge}
+                </div>
+              </div>
+              <div class="kpi-value">{esc_h(info['value'])} <span class="trend">{trend_arrow}</span></div>
+              <div class="kpi-interp">{interp}</div>
+              {f'<div class="kpi-note">{note}</div>' if (note and info['interpretation'] and note != info['interpretation']) else ''}
+              {f'<div class="kpi-source">Source: {source}</div>' if source else ''}
+            </div>
+            """
+        )
+    return '<div class="kpi-grid">' + "".join(cards) + "</div>"
+
+
+def render_recommendations(recs: list[dict]) -> str:
+    if not recs:
+        return "<p class='empty'>No actions listed.</p>"
+
+    priority_order = ["today", "tomorrow", "this_week", "next_4_weeks"]
+    labels = {
+        "today": ("Today", "the rest of today"),
+        "tomorrow": ("Tomorrow", "next 24 hours"),
+        "this_week": ("This week", "next 7 days"),
+        "next_4_weeks": ("Next 4 weeks", "28-day guardrails"),
+    }
+    by_horizon: dict[str, dict] = {}
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        h = (r.get("horizon") or "").lower().strip()
+        by_horizon[h] = r
+
+    out = ['<div class="recs">']
+    for h in priority_order:
+        if h in by_horizon:
+            r = by_horizon[h]
+            title, sub = labels[h]
+            text_short = r.get("text_short") or r.get("text", "")
+            text_full = r.get("text", "")
+            short_html = esc_h(text_short)
+            # Only show "More detail" disclosure if full text is longer than short
+            details_html = ""
+            if text_full and text_full != text_short and len(text_full) > len(text_short) + 20:
+                details_html = (
+                    f'<details class="rec-details"><summary>More detail</summary>'
+                    f'<div class="rec-full">{esc_h(text_full)}</div></details>'
+                )
+            out.append(
+                f'<div class="rec rec-{h}">'
+                f'<div class="rec-head"><span class="rec-title">{title}</span>'
+                f'<span class="rec-sub">{sub}</span></div>'
+                f'<div class="rec-text">{short_html}</div>'
+                f'{details_html}'
+                f'</div>'
+            )
+    # Any remaining horizons not in priority list
+    for h, r in by_horizon.items():
+        if h not in priority_order:
+            out.append(
+                f'<div class="rec rec-other">'
+                f'<div class="rec-head"><span class="rec-title">{esc(h.title().replace("_"," "))}</span></div>'
+                f'<div class="rec-text">{esc_h(r.get("text",""))}</div>'
+                f'</div>'
+            )
+    out.append("</div>")
+    return "".join(out)
+
+
+def render_signals(signals: list[dict]) -> str:
+    if not signals:
+        return '<p class="empty">No signals.</p>'
+    rows = []
+    for s in signals:
+        if not isinstance(s, dict):
+            continue
+        rows.append(
+            f"""
+            <div class="signal">
+              <div class="signal-name">{esc_h(s.get('signal',''))}</div>
+              <div class="signal-body">
+                <div><span class="label">Evidence</span> {esc_h(s.get('evidence',''))}</div>
+                <div><span class="label">What it means</span> {esc_h(s.get('implication',''))}</div>
+                <div class="uncertainty"><span class="label">Uncertainty</span> {esc_h(s.get('uncertainty',''))}</div>
+              </div>
+            </div>
+            """
+        )
+    return '<div class="signals">' + "".join(rows) + "</div>"
+
+
+def render_expert_section(name: str, plain_name: str, expert: dict | None) -> str:
+    if not expert:
+        return ""
+    synthesis = esc_h(expert.get("for_synthesis", ""))
+    weekly = esc_h(expert.get("for_weekly_planner", ""))
+    signals = expert.get("signals", []) or []
+    return f"""
+    <details class="expert">
+      <summary><span class="expert-name">{esc(plain_name)}</span> <span class="expert-sub">{esc(name)} view</span></summary>
+      <div class="expert-body">
+        <div class="expert-block">
+          <h4>Current state</h4>
+          <p>{synthesis or '<em class="muted">No synthesis.</em>'}</p>
+        </div>
+        {f'<div class="expert-block"><h4>For the next 7 days</h4><p>{weekly}</p></div>' if weekly else ''}
+        <div class="expert-block">
+          <h4>Key signals</h4>
+          {render_signals(signals)}
+        </div>
+      </div>
+    </details>
+    """
+
+
+def render_since_last_run(data: dict) -> str:
+    """Delta preamble — what changed since the prior analysis run.
+
+    Returns empty string when the field is absent, null, or points at a first
+    run (no prior_run_at). Skips cleanly so the caller can interpolate
+    unconditionally.
+    """
+    since = data.get("since_last_run")
+    if not isinstance(since, dict):
+        return ""
+    prior_at = since.get("prior_run_at")
+    if not prior_at:
+        return ""
+
+    headline = since.get("headline") or ""
+    transition = (since.get("physiology_transition") or "unchanged").lower()
+    new_sigs = [s for s in (since.get("new_signals") or []) if s]
+    resolved = [s for s in (since.get("resolved_signals") or []) if s]
+    new_acts = [a for a in (since.get("new_activities") or []) if a]
+    hours = since.get("hours_since")
+
+    transition_badges = {
+        "green_to_amber": ("→ AMBER", "amber"),
+        "green_to_red": ("→ RED", "red"),
+        "amber_to_red": ("→ RED", "red"),
+        "amber_to_green": ("→ GREEN", "green"),
+        "red_to_amber": ("→ AMBER", "amber"),
+        "red_to_green": ("→ GREEN", "green"),
+        "unchanged": ("unchanged", "muted"),
+    }
+    badge_text, badge_cls = transition_badges.get(transition, ("unchanged", "muted"))
+
+    prior_label = fmt_iso_date(prior_at)
+    if isinstance(hours, (int, float)) and hours >= 0:
+        prior_label = f"{prior_label} ({hours:.1f}h ago)"
+
+    def col(head: str, items: list[str]) -> str:
+        if not items:
+            return ""
+        lis = "".join(f"<li>{esc_h(s)}</li>" for s in items[:3])
+        return f'<div class="since-col"><h4>{esc(head)}</h4><ul>{lis}</ul></div>'
+
+    columns = "".join([
+        col("New signals", new_sigs),
+        col("Resolved", resolved),
+        col("New activities", new_acts),
+    ])
+    columns_block = f'<div class="since-cols">{columns}</div>' if columns else ""
+
+    return f"""
+    <section id="since-last">
+      <div class="since-card">
+        <div class="since-head">
+          <span class="since-label">Since last run</span>
+          <span class="since-prior">{esc(prior_label)}</span>
+          <span class="since-badge since-badge-{badge_cls}">{esc(badge_text)}</span>
+        </div>
+        <div class="since-headline">{esc_h(headline)}</div>
+        {columns_block}
+      </div>
+    </section>
+    """
+
+
+def render_open_questions(qs: list[str]) -> str:
+    if not qs:
+        return ""
+    items = "".join(f"<li>{esc_h(q)}</li>" for q in qs if q)
+    return f"""
+    <section id="open-questions">
+      <h2>Open questions</h2>
+      <p class="section-lead">Patterns (not one-off events) that would materially change your plan if resolved. Worth revisiting at the next analysis.</p>
+      <ol class="open-questions">{items}</ol>
+    </section>
+    """
+
+
+def render_glossary() -> str:
+    """Collapsible glossary at the end of the report."""
+    items = []
+    for abbr, (plain, defn) in sorted(GLOSSARY.items(), key=lambda x: x[1][0]):
+        items.append(
+            f'<div class="glossary-item">'
+            f'<div class="glossary-head"><span class="glossary-plain">{esc(plain)}</span>'
+            f'<span class="glossary-abbr">{esc(abbr)}</span></div>'
+            f'<div class="glossary-def">{esc(defn)}</div>'
+            f'</div>'
+        )
+    return f"""
+    <details class="glossary" id="glossary">
+      <summary><span class="glossary-title">Glossary</span> <span class="muted">— every technical term used in this report, in plain language</span></summary>
+      <div class="glossary-grid">{"".join(items)}</div>
+    </details>
+    """
+
+
+def render_season_roadmap(data: dict) -> str:
+    """Race-roadmap timeline: upcoming races + you-are-here marker on a date axis."""
+    ctx = extract_season_context(data)
+    if not ctx:
+        return ""
+    chart = chart_season_timeline(ctx)
+    if not chart:
+        return ""
+
+    return f"""
+    <section id="roadmap">
+      <h2>Road to the race</h2>
+      <p class="section-lead">Every upcoming race pinned on a timeline from today forward. Pin colors mark priority — A (red), B (amber), C (blue) — with the number of weeks until each.</p>
+      <div class="chart-panel">
+        <div class="chart-body">{chart}</div>
+      </div>
+    </section>
+    """
+
+
+def render_charts_section(raw: dict | None, metrics: dict | None = None) -> str:
+    if not raw:
+        return ""
+    tl_series = extract_training_load_series(raw)
+    hrv_series = extract_hrv_series(raw)
+    sleep_series = extract_sleep_series(raw)
+    weekly_vol = extract_weekly_volume_by_sport(raw, metrics)
+
+    tl_chart = chart_training_load(tl_series)
+    hrv_chart = chart_hrv(hrv_series)
+    sleep_chart = chart_sleep(sleep_series)
+    vol_chart = chart_weekly_volume(weekly_vol)
+
+    if not any([tl_chart, hrv_chart, sleep_chart, vol_chart]):
+        return ""
+
+    def panel(title: str, sub: str, svg: str) -> str:
+        if not svg:
+            return ""
+        return (
+            f'<div class="chart-panel">'
+            f'<div class="chart-head"><h3>{esc(title)}</h3><p class="chart-sub">{esc(sub)}</p></div>'
+            f'<div class="chart-body">{svg}</div>'
+            f'</div>'
+        )
+
+    return f"""
+    <section id="charts">
+      <h2>What the data looks like</h2>
+      <p class="section-lead">Every chart below is generated from the same Garmin data that fed the experts. Hover individual points for exact values.</p>
+      {panel(
+        "Training load over time",
+        "Fitness (teal) should rise steadily. Fatigue (amber) spikes after hard days and drops with rest. Form (purple) is Fitness minus Fatigue — positive means fresh, negative means in-training.",
+        tl_chart,
+      )}
+      {panel(
+        "Overnight recovery",
+        "The blue line is last night's heart rate variability (your recovery signal). The lavender line is the 7-day smoothed average. The gray band is your personal healthy range. Drops below the band are crash-territory, especially two nights in a row.",
+        hrv_chart,
+      )}
+      {panel(
+        "Sleep per night",
+        "Total hours with stage breakdown (deep → light → REM → awake). The red line is the 6-hour minimum; the green line is the 8-hour target. Two consecutive nights under the red line is a known crash pattern for you.",
+        sleep_chart,
+      )}
+      {panel(
+        "Weekly training volume",
+        "Kilometres per Monday-starting week, stacked by sport (running + cycling + hiking + walking + swimming). Strength and mobility sessions don't have km to stack, so they appear as a +Nx chip below the bar. Healthy progression is ≤10% increase week-over-week in total load; any single jump beyond 15% raises overuse risk.",
+        vol_chart,
+      )}
+    </section>
+    """
+
+
+# ---------------------------------------------------------------------------
+# CSS
+# ---------------------------------------------------------------------------
+
+CSS = """
+    :root {
+      --bg: #fbfbfd;
+      --card: #ffffff;
+      --card-hi: #f1f3f6;
+      --border: #e5e7eb;
+      --border-hi: #d1d5db;
+      --fg: #1d1d1f;
+      --muted: #667085;
+      --accent: #2563eb;
+      --green: #16a34a;
+      --amber: #d97706;
+      --red: #dc2626;
+      --teal: #0d9488;
+      --purple: #7c3aed;
+      --rose: #e11d48;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.55;
+      font-size: 15px;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+
+    header.masthead { border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+    header.masthead h1 { margin: 0 0 .25rem; font-size: 1.5rem; color: var(--accent); }
+    header.masthead .meta { color: var(--muted); font-size: .85rem; }
+    nav.anchor-nav { margin-top: .75rem; display: flex; flex-wrap: wrap; gap: .5rem .75rem; font-size: .85rem; }
+    nav.anchor-nav a { color: var(--muted); text-decoration: none; padding: .15rem .4rem; border: 1px solid var(--border); border-radius: 4px; }
+    nav.anchor-nav a:hover { color: var(--accent); border-color: var(--accent); }
+
+    section { margin: 2rem 0; }
+    h2 {
+      font-size: 1.15rem;
+      border-left: 3px solid var(--accent);
+      padding-left: .6rem;
+      margin: 0 0 .75rem;
+    }
+    h3 { font-size: 1rem; margin: 0 0 .5rem; color: #475569; }
+    h4 { font-size: .72rem; margin: 0 0 .35rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    p { margin: 0 0 .5rem; }
+    .muted { color: var(--muted); }
+    .section-lead { color: var(--muted); font-size: .88rem; margin-bottom: 1rem; }
+    em { font-style: italic; }
+    .empty { color: var(--muted); font-style: italic; }
+
+    /* Today panel */
+    .today-panel {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 1.25rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      margin: 1rem 0 2rem;
+    }
+    .today-panel .light {
+      border-radius: 10px;
+      padding: 1rem .75rem;
+      color: #0b0f17;
+      text-align: center;
+      min-height: 110px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .today-panel .light-label { font-size: 1.5rem; font-weight: 800; letter-spacing: .05em; }
+    .today-panel .light-sub { font-size: .75rem; text-transform: uppercase; opacity: .75; letter-spacing: .08em; }
+    .today-session { margin-bottom: .75rem; }
+    .today-session .done { font-weight: 600; color: var(--green); margin-bottom: .15rem; }
+    .today-session.no-session .done { color: var(--muted); font-weight: 400; }
+    .today-session .session-name { font-size: 1.1rem; }
+    .today-session .session-meta { color: var(--muted); font-size: .85rem; }
+    .cta {
+      margin-top: .75rem;
+      padding: .75rem 1rem;
+      border-left: 3px solid var(--accent);
+      background: var(--card-hi);
+      border-radius: 0 6px 6px 0;
+    }
+    .cta-label { font-size: .7rem; color: var(--accent); text-transform: uppercase; font-weight: 700; letter-spacing: .06em; margin-bottom: .25rem; }
+    .cta-text { font-size: .95rem; }
+
+    /* Since last run — delta preamble */
+    #since-last { margin-top: 1rem; margin-bottom: 1.25rem; }
+    .since-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--teal);
+      border-radius: 8px;
+      padding: .85rem 1.1rem;
+    }
+    .since-head {
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+      flex-wrap: wrap;
+      margin-bottom: .4rem;
+    }
+    .since-label {
+      font-size: .68rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--teal);
+    }
+    .since-prior { font-size: .78rem; color: var(--muted); }
+    .since-badge {
+      font-size: .7rem;
+      font-weight: 700;
+      padding: .1rem .45rem;
+      border-radius: 999px;
+      border: 1px solid var(--border-hi);
+      margin-left: auto;
+    }
+    .since-badge-green { color: var(--green); border-color: var(--green); }
+    .since-badge-amber { color: var(--amber); border-color: var(--amber); }
+    .since-badge-red   { color: var(--red);   border-color: var(--red); }
+    .since-badge-muted { color: var(--muted); }
+    .since-headline { font-size: .95rem; line-height: 1.55; }
+    .since-cols {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: .75rem 1.25rem;
+      margin-top: .6rem;
+    }
+    .since-col h4 { margin-bottom: .2rem; }
+    .since-col ul { margin: 0; padding-left: 1.1rem; }
+    .since-col li { font-size: .85rem; color: var(--fg); margin-bottom: .15rem; }
+
+    /* Story — structured headline + two-column bullets */
+    .story-headline {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      padding: .9rem 1.1rem;
+      font-size: 1.02rem;
+      line-height: 1.55;
+      margin-bottom: .9rem;
+    }
+    .story-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: .75rem;
+    }
+    @media (min-width: 760px) {
+      .story-grid { grid-template-columns: 1fr 1fr; }
+    }
+    .story-col {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .85rem 1rem;
+    }
+    .story-col-head {
+      font-size: .78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-bottom: .5rem;
+    }
+    .story-working { border-left: 3px solid var(--green); }
+    .story-working .story-col-head { color: var(--green); }
+    .story-concerning { border-left: 3px solid var(--amber); }
+    .story-concerning .story-col-head { color: var(--amber); }
+    .story-col ul {
+      padding-left: 1.1rem;
+      margin: 0;
+    }
+    .story-col li {
+      margin-bottom: .45rem;
+      font-size: .88rem;
+      line-height: 1.5;
+    }
+    .story-col li:last-child { margin-bottom: 0; }
+
+    /* CSS-based tooltip (browser title attr is unreliable) */
+    .tip {
+      position: relative;
+      font-size: .68rem;
+      background: #eef1f4;
+      color: var(--muted);
+      padding: .1rem .4rem;
+      border-radius: 3px;
+      border: 1px solid var(--border-hi);
+      cursor: help;
+      white-space: nowrap;
+    }
+    .tip .tip-body {
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--card-hi);
+      border: 1px solid var(--border-hi);
+      padding: .6rem .8rem;
+      border-radius: 6px;
+      font-size: .78rem;
+      line-height: 1.45;
+      width: 260px;
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transition: opacity .15s;
+      z-index: 20;
+      color: var(--fg);
+      white-space: normal;
+      text-align: left;
+      font-weight: 400;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    .tip .tip-body::after {
+      content: "";
+      position: absolute;
+      top: 100%;
+      left: 50%;
+      transform: translateX(-50%);
+      border: 6px solid transparent;
+      border-top-color: var(--border-hi);
+    }
+    .tip:hover .tip-body, .tip:focus .tip-body {
+      opacity: 1;
+      visibility: visible;
+    }
+    .abbr-plain {
+      font-size: .68rem;
+      background: #eef1f4;
+      color: var(--muted);
+      padding: .1rem .35rem;
+      border-radius: 3px;
+    }
+
+    /* Recommendation detail disclosure */
+    details.rec-details {
+      margin-top: .6rem;
+    }
+    details.rec-details summary {
+      cursor: pointer;
+      list-style: none;
+      font-size: .78rem;
+      color: var(--accent);
+      text-decoration: none;
+    }
+    details.rec-details summary::-webkit-details-marker { display: none; }
+    details.rec-details summary::before {
+      content: "▸ ";
+      font-size: .7rem;
+      display: inline-block;
+      transition: transform .15s;
+    }
+    details.rec-details[open] summary::before { transform: rotate(90deg); }
+    .rec-full {
+      margin-top: .5rem;
+      padding-top: .5rem;
+      border-top: 1px solid var(--border);
+      font-size: .85rem;
+      color: #475569;
+      line-height: 1.55;
+    }
+
+    /* Season roadmap */
+    #roadmap .chart-panel { padding: .75rem 1rem 1rem; }
+    /* KPI source attribution */
+    .kpi-source {
+      font-size: .68rem;
+      color: var(--muted);
+      margin-top: .4rem;
+      font-style: italic;
+      border-top: 1px dashed var(--border);
+      padding-top: .3rem;
+    }
+
+    /* KPIs */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: .75rem;
+    }
+    .kpi {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--border-hi);
+      border-radius: 8px;
+      padding: .75rem .9rem;
+    }
+    .kpi.status-green { border-left-color: var(--green); }
+    .kpi.status-amber, .kpi.status-yellow { border-left-color: var(--amber); }
+    .kpi.status-red { border-left-color: var(--red); }
+    .kpi-label { font-size: .75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .2rem; display: flex; align-items: center; gap: .35rem; }
+    .kpi-label .abbr {
+      font-size: .65rem;
+      background: #eef1f4;
+      color: var(--muted);
+      padding: .05rem .3rem;
+      border-radius: 3px;
+      text-decoration: none;
+      border-bottom: 1px dotted var(--muted);
+      cursor: help;
+    }
+    .kpi-value { font-size: 1.55rem; font-weight: 600; margin: .1rem 0 .2rem; }
+    .kpi-value .trend { font-size: 1rem; color: var(--muted); }
+    .kpi-interp { font-size: .82rem; color: #475569; line-height: 1.4; }
+    .kpi-note { font-size: .72rem; color: var(--muted); margin-top: .35rem; font-style: italic; }
+
+    /* Recommendations */
+    .recs { display: grid; gap: .75rem; grid-template-columns: 1fr; }
+    @media (min-width: 760px) {
+      .recs { grid-template-columns: 1fr 1fr; }
+      .rec-today, .rec-tomorrow { grid-column: span 1; }
+      .rec-this_week, .rec-next_4_weeks { grid-column: span 1; }
+    }
+    .rec {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .85rem 1rem;
+      border-left: 3px solid var(--border-hi);
+    }
+    .rec-today { border-left-color: var(--red); }
+    .rec-tomorrow { border-left-color: var(--amber); }
+    .rec-this_week { border-left-color: var(--accent); }
+    .rec-next_4_weeks { border-left-color: var(--teal); }
+    .rec-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .35rem; }
+    .rec-title { font-size: .7rem; font-weight: 800; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
+    .rec-today .rec-title { color: var(--red); }
+    .rec-tomorrow .rec-title { color: var(--amber); }
+    .rec-next_4_weeks .rec-title { color: var(--teal); }
+    .rec-sub { font-size: .7rem; color: var(--muted); }
+    .rec-text { font-size: .9rem; line-height: 1.5; }
+
+    /* Charts */
+    .chart-panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.25rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .chart-head h3 { margin: 0 0 .25rem; }
+    .chart-head .chart-sub { color: var(--muted); font-size: .82rem; margin: 0 0 .75rem; }
+    .chart-body svg { width: 100%; height: auto; display: block; }
+
+    /* Expert deep dives */
+    details.expert {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: .75rem;
+      overflow: hidden;
+    }
+    details.expert summary {
+      padding: .85rem 1rem;
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      font-size: .95rem;
+    }
+    details.expert summary::-webkit-details-marker { display: none; }
+    details.expert summary::before {
+      content: "▸";
+      color: var(--muted);
+      font-size: .8rem;
+      transition: transform .15s;
+      display: inline-block;
+    }
+    details.expert[open] summary::before { transform: rotate(90deg); }
+    details.expert summary:hover { background: var(--card-hi); }
+    .expert-name { font-weight: 600; color: #475569; }
+    .expert-sub { color: var(--muted); font-size: .8rem; }
+    .expert-body { padding: 0 1rem 1rem 2rem; }
+    .expert-block { margin-bottom: 1rem; }
+    .expert-block p { font-size: .88rem; line-height: 1.55; }
+    .signal {
+      border-left: 2px solid var(--border-hi);
+      padding-left: .75rem;
+      margin-bottom: .75rem;
+    }
+    .signal-name {
+      font-weight: 600;
+      color: var(--accent);
+      font-size: .88rem;
+      margin-bottom: .3rem;
+    }
+    .signal-body { font-size: .82rem; line-height: 1.5; }
+    .signal-body > div { margin-bottom: .25rem; }
+    .signal-body .label {
+      display: inline-block;
+      min-width: 90px;
+      color: var(--muted);
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-right: .35rem;
+    }
+    .signal-body .uncertainty { color: var(--muted); font-style: italic; }
+
+    /* Open questions */
+    ol.open-questions { padding-left: 1.25rem; }
+    ol.open-questions li {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--purple);
+      border-radius: 6px;
+      padding: .7rem .9rem;
+      margin-bottom: .5rem;
+      font-size: .88rem;
+    }
+
+    /* Glossary */
+    details.glossary {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .85rem 1rem;
+      margin-top: 2rem;
+    }
+    details.glossary summary { cursor: pointer; list-style: none; font-size: .95rem; }
+    details.glossary summary::-webkit-details-marker { display: none; }
+    details.glossary summary::before {
+      content: "▸";
+      color: var(--muted);
+      margin-right: .5rem;
+      font-size: .8rem;
+      display: inline-block;
+      transition: transform .15s;
+    }
+    details.glossary[open] summary::before { transform: rotate(90deg); }
+    .glossary-title { font-weight: 600; }
+    .glossary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: .9rem;
+      margin-top: 1rem;
+    }
+    .glossary-item {
+      border-left: 2px solid var(--border-hi);
+      padding-left: .75rem;
+    }
+    .glossary-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .15rem; }
+    .glossary-plain { font-weight: 600; color: #475569; }
+    .glossary-abbr { font-size: .7rem; color: var(--muted); background: #eef1f4; padding: .08rem .35rem; border-radius: 3px; }
+    .glossary-def { font-size: .82rem; color: var(--muted); line-height: 1.5; }
+
+    footer { color: var(--muted); font-size: .72rem; margin-top: 3rem; text-align: center; border-top: 1px solid var(--border); padding-top: 1rem; }
+    footer a { color: var(--accent); text-decoration: none; }
+    a { color: var(--accent); }
+
+    /* Mobile */
+    @media (max-width: 640px) {
+      .wrap { padding: 1rem .75rem 3rem; }
+      .today-panel { grid-template-columns: 1fr; }
+      .today-panel .light { min-height: 70px; }
+      .kpi-value { font-size: 1.3rem; }
+    }
+"""
+
+
+# ---------------------------------------------------------------------------
+# Main HTML assembly
+# ---------------------------------------------------------------------------
+
+def render_story(summary: Any) -> str:
+    """Render the structured 'story' section: headline + two-column bullets."""
+    if not isinstance(summary, dict):
+        return '<div class="story-headline"><em class="muted">No summary.</em></div>'
+    headline = esc_h(summary.get("headline", ""))
+    working = [esc_h(x) for x in (summary.get("whats_working") or []) if x]
+    concerning = [esc_h(x) for x in (summary.get("whats_concerning") or []) if x]
+    parts: list[str] = []
+    if headline:
+        parts.append(f'<div class="story-headline">{headline}</div>')
+    if working or concerning:
+        parts.append('<div class="story-grid">')
+        if working:
+            items = "".join(f'<li>{w}</li>' for w in working)
+            parts.append(
+                f'<div class="story-col story-working">'
+                f'<div class="story-col-head">✓ What&#39;s working</div>'
+                f'<ul>{items}</ul></div>'
+            )
+        if concerning:
+            items = "".join(f'<li>{c}</li>' for c in concerning)
+            parts.append(
+                f'<div class="story-col story-concerning">'
+                f'<div class="story-col-head">⚠ What needs attention</div>'
+                f'<ul>{items}</ul></div>'
+            )
+        parts.append('</div>')
+    if not parts:
+        return '<div class="story-headline"><em class="muted">No summary.</em></div>'
+    return "".join(parts)
+
+
+def render_html(data: dict, raw: dict | None, metrics: dict | None = None) -> str:
+    generated_at = fmt_iso_date(data.get("generated_at"))
+    window = esc(data.get("window_days", ""))
+    profile = esc_h((data.get("athlete") or {}).get("profile_excerpt", ""))
+    summary = data.get("executive_summary")
+    kpis = data.get("kpis") or []
+    recs = data.get("recommendations") or []
+    experts = data.get("experts") or {}
+    questions = data.get("open_questions") or []
+    plan_info = data.get("plan") or {}
+
+    plan_banner = ""
+    if plan_info:
+        plan_banner = f"""
+        <div class="plan-banner">
+          <strong>Following:</strong> {esc(plan_info.get('name',''))}
+          {f' · {esc(plan_info.get("source",""))}' if plan_info.get('source') else ''}
+          {f' · <strong>Week {esc(plan_info.get("current_week",""))}</strong>' if plan_info.get('current_week') else ''}
+        </div>
+        """
+
+    since_block = render_since_last_run(data)
+
+    nav_links = ['<a href="#today">Today</a>']
+    if since_block:
+        nav_links.append('<a href="#since-last">Since last run</a>')
+    nav_links.append('<a href="#summary">Summary</a>')
+    if extract_season_context(data):
+        nav_links.append('<a href="#roadmap">Roadmap</a>')
+    nav_links += [
+        '<a href="#kpis">Key numbers</a>',
+        '<a href="#actions">Actions</a>',
+    ]
+    if raw:
+        nav_links.append('<a href="#charts">Charts</a>')
+    nav_links += [
+        '<a href="#experts">Deep dives</a>',
+        '<a href="#open-questions">Open questions</a>',
+        '<a href="#glossary">Glossary</a>',
+    ]
+
+    html_body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>peak-lab training analysis</title>
+  <style>{CSS}</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="masthead">
+      <h1>Training analysis</h1>
+      <div class="meta">Generated {generated_at} · {window}-day window</div>
+      {plan_banner}
+      <nav class="anchor-nav">{"".join(nav_links)}</nav>
+    </header>
+
+    {render_today_panel(data, raw)}
+
+    {since_block}
+
+    <section id="summary">
+      <h2>The story</h2>
+      {render_story(summary)}
+    </section>
+
+    {render_season_roadmap(data)}
+
+    <section id="kpis">
+      <h2>Key numbers, explained</h2>
+      <p class="section-lead">Each card has its plain-language name up top and the formal abbreviation in a small badge you can hover for the technical definition.</p>
+      {render_kpis(kpis)}
+    </section>
+
+    <section id="actions">
+      <h2>What to do</h2>
+      <p class="section-lead">Actions ordered by time horizon. &quot;Today&quot; means the <em>remainder</em> of today — if you've already done a session, these are post-session instructions.</p>
+      {render_recommendations(recs)}
+    </section>
+
+    {render_charts_section(raw, metrics)}
+
+    <section id="experts">
+      <h2>Deep dives <span class="muted" style="font-size:.8rem; font-weight: 400;">(click to expand)</span></h2>
+      <p class="section-lead">Three specialist views of the same data. Each is independent — the overall story above is peak-lab's synthesis across all three.</p>
+      {render_expert_section("metrics", "Training load", experts.get("metrics"))}
+      {render_expert_section("activity", "Session quality", experts.get("activity"))}
+      {render_expert_section("physiology", "Recovery and readiness", experts.get("physiology"))}
+    </section>
+
+    {render_open_questions(questions)}
+
+    {render_glossary()}
+
+    <footer>
+      peak-lab · architecture derived from <a href="https://github.com/leonzzz435/garmin-ai-coach">leonzzz435/garmin-ai-coach</a> (MIT) ·
+      training paces via Jack Daniels' VDOT formulas (Daniels &amp; Gilbert, 1979)
+      <br>
+      Profile excerpt: <em>{profile}</em>
+    </footer>
+  </div>
+</body>
+</html>
+"""
+    return html_body
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Render peak-lab analysis HTML")
+    parser.add_argument("analysis", help="Path to analysis.json")
+    parser.add_argument("output", help="Path to write HTML")
+    parser.add_argument("--raw", default=None, help="Optional path to raw.json for charts")
+    parser.add_argument("--metrics", default=None, help="Optional path to training-metrics.json (auto-discovered next to analysis.json)")
+    parser.add_argument("--lab-zones", default=None, help="Optional path to lab-zones.json; enables the HR/pace-vs-lab-zones section (auto-discovered at ./data/lab-zones.json)")
+    parser.add_argument("--raw90", default=None, help="Optional path to a wider (e.g. 90-day) raw.json for the HR/pace section (auto-discovered as raw-90d.json next to analysis.json)")
+    args = parser.parse_args(argv[1:])
+
+    src = Path(args.analysis)
+    dst = Path(args.output)
+    if not src.exists():
+        print(f"error: input file not found: {src}", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(src.read_text())
+    except json.JSONDecodeError as e:
+        print(f"error: invalid JSON in {src}: {e}", file=sys.stderr)
+        return 1
+
+    # Auto-discover raw.json next to analysis.json
+    raw_path = Path(args.raw) if args.raw else (src.parent / "raw.json")
+    raw_data: dict | None = None
+    if raw_path.exists():
+        try:
+            raw_data = json.loads(raw_path.read_text())
+        except Exception as e:
+            print(f"warning: could not parse {raw_path}: {e} (charts will be omitted)", file=sys.stderr)
+            raw_data = None
+
+    # Auto-discover training-metrics.json next to analysis.json
+    metrics_path = Path(args.metrics) if args.metrics else (src.parent / "training-metrics.json")
+    metrics_data: dict | None = None
+    if metrics_path.exists():
+        try:
+            metrics_data = json.loads(metrics_path.read_text())
+        except Exception as e:
+            print(f"warning: could not parse {metrics_path}: {e} (weekly chart will fall back to raw.json aggregation)", file=sys.stderr)
+            metrics_data = None
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(render_html(data, raw_data, metrics_data))
+
+    # Optional: append the HR/pace-vs-lab-zones section. This is a bundled,
+    # data-gated feature — it runs only when the training project supplies a
+    # lab-zones file (default ./data/lab-zones.json) and a wider raw window
+    # (default raw-90d.json next to analysis.json). Because the section is
+    # (re)generated on every render, any later re-render of this HTML
+    # reproduces it automatically — no caller needs to know it exists, and
+    # downstream tools that re-render don't have to re-inject. The injector
+    # is a separate uv/scipy
+    # script, keeping this renderer stdlib-only. Failures are non-fatal: the
+    # rest of the report stands on its own.
+    lab_zones_path = Path(args.lab_zones) if args.lab_zones else Path("data/lab-zones.json")
+    raw90_path = Path(args.raw90) if args.raw90 else (src.parent / "raw-90d.json")
+    hrpace_script = Path(__file__).resolve().parent / "hrpace-lab-section"
+    hrpace_added = False
+    if lab_zones_path.exists() and raw90_path.exists() and hrpace_script.exists():
+        try:
+            r = subprocess.run(
+                [str(hrpace_script), str(raw90_path), str(lab_zones_path), "--inject", str(dst)],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                hrpace_added = True
+            else:
+                print(f"warning: HR/pace-lab section skipped: {r.stderr.strip()}", file=sys.stderr)
+        except Exception as e:
+            print(f"warning: HR/pace-lab section skipped: {e}", file=sys.stderr)
+
+    size = dst.stat().st_size
+    parts = []
+    if raw_data:
+        parts.append("charts")
+    if metrics_data:
+        parts.append("metrics")
+    if hrpace_added:
+        parts.append("hr/pace-lab")
+    extras = " with " + "+".join(parts) if parts else ""
+    print(f"wrote {dst} ({size} bytes{extras})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

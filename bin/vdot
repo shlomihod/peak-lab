@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+vdot: compute Jack Daniels VDOT from a race time+distance and print a
+training pace table.
+
+All math is from Daniels & Gilbert (1979), republished in Daniels'
+Running Formula (multiple editions). No API calls, no credentials,
+no network — stdlib only.
+
+Usage:
+    vdot <TIME> <DISTANCE>
+    vdot 4:39:28 marathon
+    vdot 2:05:47 half
+    vdot 54:56 10k
+    vdot 25:38 5k
+    vdot 19:15 5000              # explicit distance in meters
+    vdot 19:15 5000m
+    vdot 3:45 1500
+
+Output:
+    The VDOT value (a pseudo-VO2max score combining aerobic capacity and
+    running economy) plus per-zone target paces for Easy, Marathon,
+    Threshold, Interval, and Repetition training.
+
+--------------------------------------------------------------------------
+FORMULA PROVENANCE
+--------------------------------------------------------------------------
+
+**Primary source (the 1979 paper / booklet):**
+    Daniels, J., & Gilbert, J. (1979). *Oxygen Power: Performance Tables
+    for Distance Runners.* Self-published monograph. This is where the
+    original Daniels-Gilbert equations first appeared.
+
+**Book form (most accessible primary source today):**
+    Daniels, J. (1998-2014). *Daniels' Running Formula.* Human Kinetics.
+    Multiple editions (1st 1998, 2nd 2005, 3rd 2014). The training pace
+    zones (E/M/T/I/R as fractions of VO2max) are defined here.
+
+**Independent verifications consulted while writing this script:**
+    - https://github.com/mekeetsa/vdot — open-source implementation that
+      cites Daniels & Gilbert 1979 and Daniels' Running Formula 2nd ed.
+    - https://runbundle.com/tools/vo2-max-calculators/vo2-max-calculator
+      — web calculator that publishes the combined formula verbatim.
+    - https://www.had2know.org/health/vo2-max-calculator-racing-daniels-gilbert.html
+      — educational page crediting Daniels-Gilbert with the VO2(velocity)
+      form and v-in-m/min units.
+
+**Equation 1 — VO2 cost at running velocity** (Daniels-Gilbert 1979):
+
+    VO2(v) = -4.60 + 0.182258 * v + 0.000104 * v^2
+
+    where:
+      VO2 is in mL per kg per minute (mL·kg^-1·min^-1)
+      v is running velocity in meters per minute (m/min)
+
+    NOTE on units: v MUST be in m/min, not m/s. Some secondary sources
+    mislabel the unit; the formula only produces physiologically plausible
+    VO2 values when v is in m/min (e.g. v=250 m/min ≈ 4:00/km gives
+    VO2 ≈ 47.5 mL/kg/min, which is correct; v in m/s gives nonsense).
+
+**Equation 2 — Fraction of VO2max sustainable over duration** (Daniels-
+Gilbert 1979):
+
+    %VO2max(t) = 0.8
+               + 0.1894393 * exp(-0.012778 * t)
+               + 0.2989558 * exp(-0.1932605 * t)
+
+    where:
+      %VO2max is a dimensionless fraction (0.80 at very long durations,
+      approaching 1.0 at very short durations)
+      t is race duration in minutes
+
+**VDOT calculation:**
+
+    Given a race distance d (meters) and time t (minutes):
+      v       = d / t                    (velocity in m/min)
+      VO2     = Equation 1 applied to v  (oxygen cost at race pace)
+      frac    = Equation 2 applied to t  (fraction sustainable)
+      VDOT    = VO2 / frac               (implied max oxygen uptake)
+
+**Equation 3 — Inverting VO2(v) to get target velocity from target VO2:**
+
+    Given a target VO2, solve the quadratic
+        0.000104 * v^2 + 0.182258 * v + (-4.60 - target_VO2) = 0
+    for v, taking the positive root:
+        v = (-0.182258 + sqrt(0.182258^2
+                              + 4 * 0.000104 * (target_VO2 + 4.60)))
+            / (2 * 0.000104)
+
+**Training intensity zones** (from Daniels' Running Formula; the exact
+percentages vary slightly between editions — ranges below are the
+published Daniels canon and are independently verified at multiple
+secondary sources including runbundle, vdoto2, runningtimecalculator.com
+and the LetsRun community archive):
+
+    Easy       (E):  65%–78% VO2max   (long & recovery runs)
+    Marathon   (M):  80%–84% VO2max   (goal marathon pace)
+    Threshold  (T):  86%–88% VO2max   (tempo / LT runs)
+    Interval   (I):  95%–100% VO2max  (VO2max repeats)
+    Repetition (R): 105%–110% VO2max  (supramaximal speed reps)
+
+This script reports the full range for each zone rather than a single
+point, because coach prescription varies within the band.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+from dataclasses import dataclass
+
+
+# Primary Daniels-Gilbert 1979 constants
+A0 = -4.60
+A1 = 0.182258
+A2 = 0.000104
+
+B0 = 0.8
+B1 = 0.1894393
+B1_K = -0.012778
+B2 = 0.2989558
+B2_K = -0.1932605
+
+# Training zone percentages (%VO2max), per Daniels' Running Formula
+ZONES: list[tuple[str, str, float, float]] = [
+    ("E",  "Easy",       0.65, 0.78),
+    ("M",  "Marathon",   0.80, 0.84),
+    ("T",  "Threshold",  0.86, 0.88),
+    ("I",  "Interval",   0.95, 1.00),
+    ("R",  "Repetition", 1.05, 1.10),
+]
+
+# Canonical distance aliases → meters
+DISTANCE_ALIASES: dict[str, int] = {
+    "1500":       1500,
+    "1500m":      1500,
+    "mile":       1609,
+    "1mi":        1609,
+    "3000":       3000,
+    "3k":         3000,
+    "3000m":      3000,
+    "2mile":      3218,
+    "5000":       5000,
+    "5k":         5000,
+    "5000m":      5000,
+    "8k":         8000,
+    "10000":     10000,
+    "10k":       10000,
+    "10000m":    10000,
+    "15k":       15000,
+    "10mile":    16094,
+    "10mi":      16094,
+    "20k":       20000,
+    "half":      21097,  # 21.0975 km
+    "halfmarathon": 21097,
+    "halfmarathon21k": 21097,
+    "hm":        21097,
+    "25k":       25000,
+    "30k":       30000,
+    "marathon":  42195,  # 42.195 km
+    "m":         42195,
+    "full":      42195,
+    "42k":       42195,
+    "50k":       50000,
+}
+
+
+def parse_time(s: str) -> float:
+    """Parse h:mm:ss, mm:ss, or plain seconds → minutes."""
+    s = s.strip()
+    parts = s.split(":")
+    if len(parts) == 1:
+        # bare seconds
+        return float(parts[0]) / 60.0
+    if len(parts) == 2:
+        m, sec = parts
+        return float(m) + float(sec) / 60.0
+    if len(parts) == 3:
+        h, m, sec = parts
+        return float(h) * 60.0 + float(m) + float(sec) / 60.0
+    raise ValueError(f"cannot parse time: {s!r}")
+
+
+def parse_distance(s: str) -> int:
+    """Parse distance alias → meters."""
+    key = s.strip().lower().replace(" ", "").replace(".", "")
+    if key in DISTANCE_ALIASES:
+        return DISTANCE_ALIASES[key]
+    # try as raw meters
+    if key.endswith("m"):
+        key = key[:-1]
+    if key.endswith("km"):
+        return int(float(key[:-2]) * 1000)
+    try:
+        return int(float(key))
+    except ValueError:
+        raise ValueError(
+            f"unknown distance: {s!r}. "
+            f"Try: 5k, 10k, half, marathon, or an explicit meters value."
+        )
+
+
+def vo2_at_velocity(v_m_per_min: float) -> float:
+    """Daniels-Gilbert Eq.1: oxygen cost at velocity v (m/min)."""
+    return A0 + A1 * v_m_per_min + A2 * v_m_per_min ** 2
+
+
+def frac_vo2max_over_duration(t_min: float) -> float:
+    """Daniels-Gilbert Eq.2: sustainable fraction of VO2max over t minutes."""
+    return B0 + B1 * math.exp(B1_K * t_min) + B2 * math.exp(B2_K * t_min)
+
+
+def velocity_for_vo2(target_vo2: float) -> float:
+    """Invert Eq.1 to find velocity (m/min) that produces a given VO2."""
+    c = A0 - target_vo2
+    disc = A1 * A1 - 4.0 * A2 * c
+    if disc < 0:
+        raise ValueError(f"no real solution for VO2={target_vo2}")
+    return (-A1 + math.sqrt(disc)) / (2.0 * A2)
+
+
+def fmt_pace_per_km(v_m_per_min: float) -> str:
+    """Convert velocity (m/min) → M:SS/km."""
+    if v_m_per_min <= 0:
+        return "—"
+    sec_per_km = 60000.0 / v_m_per_min  # 1000 m / (m/min) * 60 s/min
+    m = int(sec_per_km // 60)
+    s = int(round(sec_per_km - m * 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m}:{s:02d}/km"
+
+
+def fmt_pace_per_mi(v_m_per_min: float) -> str:
+    if v_m_per_min <= 0:
+        return "—"
+    sec_per_mi = 96560.0 / v_m_per_min  # 1609.34 m
+    m = int(sec_per_mi // 60)
+    s = int(round(sec_per_mi - m * 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m}:{s:02d}/mi"
+
+
+def fmt_time(t_min: float) -> str:
+    total_sec = int(round(t_min * 60))
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+@dataclass
+class ZoneResult:
+    code: str
+    name: str
+    pct_low: float
+    pct_high: float
+    v_low: float
+    v_high: float
+
+    def format_line(self, use_mi: bool = False) -> str:
+        fmt = fmt_pace_per_mi if use_mi else fmt_pace_per_km
+        lo = fmt(self.v_low)
+        hi = fmt(self.v_high)
+        if self.pct_low == self.pct_high:
+            pct = f"{int(self.pct_low * 100)}%"
+        else:
+            pct = f"{int(self.pct_low * 100)}-{int(self.pct_high * 100)}%"
+        return f"  {self.code:2s} {self.name:11s} {pct:>8s} VO2max   {hi:>10s} – {lo:<10s}"
+
+
+def compute(distance_m: int, time_min: float) -> dict:
+    v_race = distance_m / time_min  # m/min
+    vo2_race = vo2_at_velocity(v_race)
+    frac = frac_vo2max_over_duration(time_min)
+    vdot = vo2_race / frac
+
+    zones: list[ZoneResult] = []
+    for code, name, pct_lo, pct_hi in ZONES:
+        # "low" pace = slower end of the zone (lower %), "high" = faster
+        v_slow = velocity_for_vo2(vdot * pct_lo)
+        v_fast = velocity_for_vo2(vdot * pct_hi)
+        zones.append(
+            ZoneResult(code, name, pct_lo, pct_hi, v_slow, v_fast)
+        )
+
+    return {
+        "input": {
+            "distance_m": distance_m,
+            "time_min": time_min,
+            "velocity_m_per_min": v_race,
+            "pace_per_km": fmt_pace_per_km(v_race),
+            "pace_per_mi": fmt_pace_per_mi(v_race),
+        },
+        "vo2_at_race_pace": vo2_race,
+        "fraction_vo2max_sustainable": frac,
+        "vdot": vdot,
+        "zones": zones,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Jack Daniels VDOT calculator. Input a race time and distance; "
+            "output VDOT score and training pace zones."
+        ),
+        epilog=(
+            "Formulas from Daniels & Gilbert (1979), "
+            "'Oxygen Power: Performance Tables for Distance Runners'. "
+            "See the script docstring for full citations."
+        ),
+    )
+    parser.add_argument("time", help="Race time (h:mm:ss, mm:ss, or seconds)")
+    parser.add_argument(
+        "distance",
+        help=(
+            "Race distance alias (5k, 10k, half, marathon, mile) "
+            "or explicit meters (e.g. 5000, 5000m, 21.0975km)"
+        ),
+    )
+    parser.add_argument(
+        "--miles",
+        action="store_true",
+        help="Print paces in min/mile instead of min/km",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a table",
+    )
+    args = parser.parse_args()
+
+    try:
+        t_min = parse_time(args.time)
+        d_m = parse_distance(args.distance)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    result = compute(d_m, t_min)
+
+    if args.json:
+        import json as _json
+
+        out = {
+            "input": result["input"],
+            "vo2_at_race_pace_ml_kg_min": round(result["vo2_at_race_pace"], 2),
+            "fraction_vo2max_sustainable": round(result["fraction_vo2max_sustainable"], 4),
+            "vdot": round(result["vdot"], 1),
+            "zones": [
+                {
+                    "code": z.code,
+                    "name": z.name,
+                    "pct_vo2max_low": z.pct_low,
+                    "pct_vo2max_high": z.pct_high,
+                    "pace_slow_per_km": fmt_pace_per_km(z.v_low),
+                    "pace_fast_per_km": fmt_pace_per_km(z.v_high),
+                    "pace_slow_per_mi": fmt_pace_per_mi(z.v_low),
+                    "pace_fast_per_mi": fmt_pace_per_mi(z.v_high),
+                }
+                for z in result["zones"]
+            ],
+        }
+        print(_json.dumps(out, indent=2))
+        return 0
+
+    i = result["input"]
+    unit_label = "mile" if args.miles else "km"
+    race_pace = i["pace_per_mi"] if args.miles else i["pace_per_km"]
+    print()
+    print(f"  Race        : {fmt_time(i['time_min'])} over {i['distance_m']} m")
+    print(f"  Velocity    : {i['velocity_m_per_min']:.1f} m/min  ({race_pace})")
+    print(f"  VO2 at pace : {result['vo2_at_race_pace']:.1f} mL·kg⁻¹·min⁻¹")
+    print(f"  %VO2max     : {result['fraction_vo2max_sustainable']*100:.1f}%  (sustainable for this duration)")
+    print(f"  VDOT        : {result['vdot']:.1f}")
+    print()
+    print("  Training paces (from slowest → fastest end of each zone):")
+    print(f"  {'Zone':3s} {'Name':12s} {'%VO2max':>8s}   pace ({unit_label})")
+    for z in result["zones"]:
+        print(z.format_line(use_mi=args.miles))
+    print()
+    print("  Daniels & Gilbert (1979) / Daniels' Running Formula.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

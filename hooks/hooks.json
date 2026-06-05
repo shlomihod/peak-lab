@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v uv >/dev/null 2>&1 || echo \"[peak-lab] warning: uv is not installed. Install it from https://docs.astral.sh/uv/ before running /peak-lab:analyze.\"; [ -f \"$HOME/.garminconnect/garmin_tokens.json\" ] || echo \"[peak-lab] warning: no Garmin tokens at ~/.garminconnect/garmin_tokens.json. Run /peak-lab:setup to authenticate.\"'"
+          }
+        ]
+      }
+    ]
+  }
+}

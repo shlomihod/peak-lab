@@ -1,0 +1,37 @@
+peak-lab
+========
+
+This plugin is a Claude Code port of and derivative work from:
+
+  leonzzz435/garmin-ai-coach
+  https://github.com/leonzzz435/garmin-ai-coach
+  Licensed under the MIT License.
+
+The expert subagent system prompts in agents/metrics-expert.md,
+agents/activity-expert.md, and agents/physiology-expert.md are adapted from
+the corresponding metrics_expert_node.py, activity_expert_node.py, and
+physiology_expert_node.py files in that project, including the
+Signals / Evidence / Implications / Uncertainty framing and the two-output
+contract (for_synthesis / for_weekly_planner).
+
+The HTML dashboard layout in bin/render-analysis is inspired by the
+analysis.html template from the upstream project.
+
+At runtime, peak-lab depends on (but does not vendor) the following
+third-party projects:
+
+  cyberjunky/python-garminconnect
+  https://github.com/cyberjunky/python-garminconnect
+  The Python library peak-lab uses to talk to Garmin Connect directly,
+  via the bundled CLIs `bin/fetch-garmin` (bulk pulls) and
+  `bin/garmin-call` (single-method read-only drill-downs). Resolved at
+  runtime through uv's PEP 723 inline script dependencies; not bundled
+  with this plugin.
+
+Name disambiguation
+-------------------
+
+"peak-lab" is an independent third-party plugin and is **not** affiliated with,
+endorsed by, or connected to Garmin Ltd. or its "Garmin Coach" adaptive
+training plan feature. The plugin analyzes data exported from Garmin Connect
+but is not a Garmin product.

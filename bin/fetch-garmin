@@ -1,0 +1,513 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "garminconnect>=0.3.2",
+#     "curl_cffi>=0.6",
+# ]
+# ///
+"""
+fetch-garmin: pull a window of Garmin Connect data and write it to one
+JSON file. peak-lab's analyze skill calls this to build raw.json.
+
+Usage:
+    fetch-garmin --days 60 --out /path/to/raw.json
+    fetch-garmin --days 60 --prev ~/.../runs/latest/raw.json --out raw.json
+
+The window always ends at "today UTC" and spans --days days back. --prev is
+safe to pass unconditionally: if the file doesn't exist the run falls back to
+a full fetch. To force a full fetch on demand, simply omit --prev.
+
+Reads OAuth tokens from $GARMINTOKENS or ~/.garminconnect (set up once
+via bin/garmin-auth). Never prompts — non-interactive only.
+
+Output schema (top-level keys):
+    fetched_at, window_days, start_date, end_date,
+    fetch_mode, tail_days, reused_from, data_sources,
+    activities, stats, sleep, hrv, body_battery, training_status,
+    training_readiness, heart_rates, weigh_ins,
+    training_plans, adaptive_plan_details, scheduled_workouts,
+    personal_records, race_predictions,
+    fetch_errors
+
+Per-day endpoints produce { "YYYY-MM-DD": <payload> } maps. Failures
+are recorded in fetch_errors instead of aborting the whole run, so
+peak-lab's experts can reason over partial data.
+
+Incremental mode: when --prev points at a readable raw.json from an
+earlier run, per-day maps (stats/sleep/hrv/heart_rates/training_status/
+training_readiness) and the activities list are reused for days outside
+the rolling tail window. The tail (last 3 days including today) is
+always refetched, to absorb late sleep scoring and late activity
+uploads. Plans, scheduled workouts, PRs, race predictions, body_battery,
+and weigh_ins are always refetched in full — they're rolling/cheap. If
+--prev is missing, unreadable, or malformed, the run falls back to a
+full fetch.
+
+Notes:
+- `body_battery` is fetched in 7-day chunks because the upstream endpoint
+  rejects ranges larger than ~7 days.
+- `training_plans` + `adaptive_plan_details` capture the full Garmin Coach
+  / adaptive plan task list so the experts can reconcile the plan with
+  current readiness. Every active plan is fetched.
+- `scheduled_workouts` spans 2 months back + 2 months forward so the
+  experts can see both recent plan adherence and the upcoming block.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+# Scrub OAuth tokens and auth headers from exception strings before they land
+# in stderr or the LLM context. garminconnect / curl_cffi sometimes embed full
+# request URLs and Authorization headers in their exception messages.
+_SECRET_RE = re.compile(
+    r"(?:Bearer\s+\S+|oauth_token=\S+|access_token=\S+|"
+    r"Authorization:\s*\S+|Cookie:\s*[^\s,]+|token=[^&\s]+)",
+    re.IGNORECASE,
+)
+
+
+def scrub_err(e: BaseException, limit: int = 120) -> str:
+    """Return a sanitized exception string safe for stderr/logs."""
+    return _SECRET_RE.sub("<REDACTED>", f"{type(e).__name__}: {e}")[:limit]
+
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+)
+
+
+def tokenstore_path() -> str:
+    return str(Path(os.getenv("GARMINTOKENS", "~/.garminconnect")).expanduser())
+
+
+def daterange(start: date, end: date):
+    d = start
+    while d <= end:
+        yield d
+        d += timedelta(days=1)
+
+
+def per_day(api_method, dates: list[date], errors: list[dict], label: str) -> dict:
+    out: dict[str, object] = {}
+    for d in dates:
+        ds = d.isoformat()
+        try:
+            out[ds] = api_method(ds)
+        except Exception as e:
+            errors.append({"endpoint": label, "date": ds, "error": scrub_err(e)})
+    return out
+
+
+def load_prior(path: str | None) -> dict | None:
+    """Load a prior raw.json if present and parseable; else return None."""
+    if not path:
+        return None
+    p = Path(path).expanduser()
+    if not p.exists():
+        return None  # fetch_mode in the output already records full vs incremental
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        print(f"  --prev {p}: unreadable ({scrub_err(e)}), falling back to full fetch", file=sys.stderr)
+        return None
+
+
+def reuse_per_day(
+    prior_map: object,
+    fetch_dates: set[str],
+    window_dates: set[str],
+) -> dict:
+    """Keep prior per-day entries that are in the current window but NOT in
+    the refetch set. Returns a fresh dict."""
+    if not isinstance(prior_map, dict):
+        return {}
+    return {
+        k: v for k, v in prior_map.items()
+        if k in window_dates and k not in fetch_dates
+    }
+
+
+def activity_date(act: dict) -> str | None:
+    """Extract YYYY-MM-DD from an activity summary. Tries the common fields."""
+    for key in ("startTimeLocal", "startTimeGMT"):
+        v = act.get(key)
+        if isinstance(v, str) and len(v) >= 10:
+            return v[:10]
+    return None
+
+
+def merge_activities(
+    prior: object,
+    fresh: list,
+    tail_start: date,
+    window_start: date,
+    window_end: date,
+) -> tuple[list, int, int]:
+    """Merge prior activities (pre-tail, within window) with freshly fetched
+    activities. Dedup by activityId, falling back to (startTimeLocal, type).
+    Returns (merged, reused_count, fresh_count)."""
+    reused: list = []
+    if isinstance(prior, list):
+        for act in prior:
+            if not isinstance(act, dict):
+                continue
+            d = activity_date(act)
+            if d is None:
+                continue
+            if d < window_start.isoformat() or d > window_end.isoformat():
+                continue
+            if d >= tail_start.isoformat():
+                continue  # the tail will be freshly refetched
+            reused.append(act)
+
+    seen: set = set()
+    merged: list = []
+
+    def key_for(act: dict):
+        aid = act.get("activityId")
+        if aid is not None:
+            return ("id", aid)
+        return ("fallback", act.get("startTimeLocal"), act.get("activityType"))
+
+    # Fresh first so newer edits win over any (shouldn't-happen) overlap.
+    for act in fresh or []:
+        if not isinstance(act, dict):
+            continue
+        k = key_for(act)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(act)
+    for act in reused:
+        k = key_for(act)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(act)
+
+    return merged, len(reused), len(fresh or [])
+
+
+def safe_call(api_method, *args, errors: list[dict], label: str, default=None):
+    try:
+        return api_method(*args)
+    except Exception as e:
+        # Keep arg count and types, not values — free-text args can contain
+        # Garmin-returned content that's already been flagged as untrusted.
+        errors.append({"endpoint": label, "arg_count": len(args), "error": scrub_err(e)})
+        return default
+
+
+def login() -> Garmin:
+    path = tokenstore_path()
+    if not Path(path).exists():
+        print(
+            f"error: no Garmin tokens at {path}. Run bin/garmin-auth first.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        api = Garmin()
+        api.login(path)
+        return api
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
+        print(f"error: saved tokens invalid: {scrub_err(e)}", file=sys.stderr)
+        print("Re-run bin/garmin-auth --force to refresh.", file=sys.stderr)
+        sys.exit(2)
+
+
+def fetch_body_battery_chunked(
+    api: Garmin, start: date, end: date, errors: list[dict]
+) -> list:
+    """Body battery endpoint rejects ranges larger than ~7 days. Chunk it."""
+    out: list = []
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(chunk_start + timedelta(days=6), end)
+        try:
+            result = api.get_body_battery(chunk_start.isoformat(), chunk_end.isoformat())
+            if isinstance(result, list):
+                out.extend(result)
+            elif result is not None:
+                out.append(result)
+        except Exception as e:
+            errors.append(
+                {
+                    "endpoint": "get_body_battery",
+                    "chunk_start": chunk_start.isoformat(),
+                    "chunk_end": chunk_end.isoformat(),
+                    "error": scrub_err(e),
+                }
+            )
+        chunk_start = chunk_end + timedelta(days=1)
+    return out
+
+
+def iter_months(start: date, end: date):
+    """Yield (year, month) tuples covering every month between start and end inclusive."""
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+
+
+def fetch_training_plans(api: Garmin, errors: list[dict]) -> tuple[list, dict]:
+    """Fetch the plan list and each adaptive plan's full task list."""
+    plans_response = safe_call(
+        api.get_training_plans,
+        errors=errors,
+        label="get_training_plans",
+        default=None,
+    )
+    plan_list: list = []
+    adaptive_details: dict[str, object] = {}
+
+    if isinstance(plans_response, dict):
+        plan_list = plans_response.get("trainingPlanList") or []
+    elif isinstance(plans_response, list):
+        plan_list = plans_response
+
+    for plan in plan_list:
+        if not isinstance(plan, dict):
+            continue
+        plan_id = plan.get("trainingPlanId")
+        if plan_id is None:
+            continue
+        category = (plan.get("trainingPlanCategory") or "").upper()
+        is_adaptive = "ADAPTIVE" in category
+        method = (
+            api.get_adaptive_training_plan_by_id
+            if is_adaptive
+            else api.get_training_plan_by_id
+        )
+        label = (
+            "get_adaptive_training_plan_by_id"
+            if is_adaptive
+            else "get_training_plan_by_id"
+        )
+        detail = safe_call(
+            method, plan_id, errors=errors, label=label, default=None
+        )
+        if detail is not None:
+            adaptive_details[str(plan_id)] = detail
+
+    return plan_list, adaptive_details
+
+
+TAIL_DAYS = 3  # always-refetch rolling window in incremental mode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fetch a window of Garmin Connect data")
+    parser.add_argument("--days", type=int, default=60, help="Window size ending today UTC (default 60)")
+    parser.add_argument("--out", type=str, required=True, help="Path to write raw.json")
+    parser.add_argument("--prev", type=str, default=None, help="Path to previous raw.json to reuse historical days from; safe to pass unconditionally — missing file falls back to full fetch")
+    args = parser.parse_args()
+
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=args.days - 1)
+
+    window_days = (end - start).days + 1
+    dates = list(daterange(start, end))
+    errors: list[dict] = []
+
+    # Decide incremental vs full.
+    prior = load_prior(args.prev)
+    incremental = prior is not None
+    tail_start = max(start, end - timedelta(days=TAIL_DAYS - 1))
+    reused_act_count = 0
+    fresh_act_count = 0
+
+    if incremental:
+        fetch_dates = [d for d in dates if d >= tail_start]
+        # Also fetch any prefix not covered by the prior window.
+        prior_start: date | None = None
+        prior_end: date | None = None
+        try:
+            prior_start = date.fromisoformat(prior.get("start_date", ""))
+            prior_end = date.fromisoformat(prior.get("end_date", ""))
+        except (ValueError, TypeError) as e:
+            print(f"  prior raw.json has malformed start/end dates ({e}); prefix-gap fill skipped", file=sys.stderr)
+        if prior_start and start < prior_start:
+            gap = [d for d in dates if d < prior_start and d < tail_start]
+            fetch_dates = sorted(set(fetch_dates) | set(gap))
+        print(
+            f"fetching {window_days} days: {start} → {end} "
+            f"[incremental: {len(fetch_dates)} days to refetch, "
+            f"{window_days - len(fetch_dates)} reused]",
+            file=sys.stderr,
+        )
+    else:
+        fetch_dates = dates
+        print(f"fetching {window_days} days: {start} → {end} [full]", file=sys.stderr)
+
+    fetch_date_set = {d.isoformat() for d in fetch_dates}
+    window_date_set = {d.isoformat() for d in dates}
+
+    api = login()
+
+    # --- Activities: incremental means refetch only the tail (+ prefix gap
+    # if the window grew) and merge pre-tail entries from prior.
+    if incremental:
+        fetch_act_start = min(fetch_dates) if fetch_dates else tail_start
+        fetch_act_end = end
+        fresh_activities = safe_call(
+            api.get_activities_by_date,
+            fetch_act_start.isoformat(), fetch_act_end.isoformat(),
+            errors=errors, label="get_activities_by_date", default=[],
+        ) or []
+        activities, reused_act_count, fresh_act_count = merge_activities(
+            prior.get("activities"), fresh_activities,
+            tail_start, start, end,
+        )
+        print(
+            f"  activities: {len(activities)} "
+            f"({fresh_act_count} fresh, {reused_act_count} reused)",
+            file=sys.stderr,
+        )
+    else:
+        activities = safe_call(
+            api.get_activities_by_date, start.isoformat(), end.isoformat(),
+            errors=errors, label="get_activities_by_date", default=[],
+        ) or []
+        fresh_act_count = len(activities)
+        print(f"  activities: {fresh_act_count}", file=sys.stderr)
+
+    def build_per_day(api_method, prior_key: str, label: str) -> dict:
+        fresh = per_day(api_method, fetch_dates, errors, label)
+        if not incremental:
+            return fresh
+        reused = reuse_per_day(prior.get(prior_key), fetch_date_set, window_date_set)
+        merged = dict(reused)
+        merged.update(fresh)  # fresh wins
+        return merged
+
+    stats = build_per_day(api.get_stats, "stats", "get_stats")
+    sleep = build_per_day(api.get_sleep_data, "sleep", "get_sleep_data")
+    hrv = build_per_day(api.get_hrv_data, "hrv", "get_hrv_data")
+    training_status = build_per_day(api.get_training_status, "training_status", "get_training_status")
+    training_readiness = build_per_day(api.get_training_readiness, "training_readiness", "get_training_readiness")
+    heart_rates = build_per_day(api.get_heart_rates, "heart_rates", "get_heart_rates")
+
+    print(f"  body_battery: fetching in 7-day chunks", file=sys.stderr)
+    body_battery = fetch_body_battery_chunked(api, start, end, errors)
+
+    weigh_ins = safe_call(
+        api.get_weigh_ins, start.isoformat(), end.isoformat(),
+        errors=errors, label="get_weigh_ins", default=None,
+    )
+
+    print(f"  training plans + adaptive details", file=sys.stderr)
+    training_plans, adaptive_plan_details = fetch_training_plans(api, errors)
+    print(
+        f"    {len(training_plans)} plan(s), {len(adaptive_plan_details)} with details",
+        file=sys.stderr,
+    )
+
+    # Scheduled workouts: 2 months back + 2 months forward
+    schedule_start = start - timedelta(days=30)
+    schedule_end = end + timedelta(days=60)
+    print(
+        f"  scheduled_workouts: {schedule_start} → {schedule_end}",
+        file=sys.stderr,
+    )
+    scheduled_workouts: dict[str, object] = {}
+    for y, m in iter_months(schedule_start, schedule_end):
+        key = f"{y:04d}-{m:02d}"
+        result = safe_call(
+            api.get_scheduled_workouts,
+            y,
+            m,
+            errors=errors,
+            label="get_scheduled_workouts",
+            default=None,
+        )
+        if result is not None:
+            scheduled_workouts[key] = result
+
+    print(f"  personal records", file=sys.stderr)
+    personal_records = safe_call(
+        api.get_personal_record,
+        errors=errors,
+        label="get_personal_record",
+        default=None,
+    )
+
+    print(f"  race predictions", file=sys.stderr)
+    race_predictions = safe_call(
+        api.get_race_predictions,
+        errors=errors,
+        label="get_race_predictions",
+        default=None,
+    )
+
+    refetched_sorted = sorted(fetch_date_set)
+    reused_sorted = sorted(window_date_set - fetch_date_set) if incremental else []
+    per_day_provenance = {
+        "refetched": refetched_sorted,
+        "reused": reused_sorted,
+    }
+    data_sources = {
+        "stats": per_day_provenance,
+        "sleep": per_day_provenance,
+        "hrv": per_day_provenance,
+        "heart_rates": per_day_provenance,
+        "training_status": per_day_provenance,
+        "training_readiness": per_day_provenance,
+        "activities": {
+            "refetched_range": [
+                (min(fetch_dates) if fetch_dates else start).isoformat(),
+                end.isoformat(),
+            ],
+            "reused_count": reused_act_count,
+            "fresh_count": fresh_act_count,
+        },
+    }
+
+    payload = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "window_days": window_days,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "fetch_mode": "incremental" if incremental else "full",
+        "tail_days": TAIL_DAYS if incremental else None,
+        "reused_from": str(Path(args.prev).expanduser()) if incremental else None,
+        "data_sources": data_sources,
+        "activities": activities,
+        "stats": stats,
+        "sleep": sleep,
+        "hrv": hrv,
+        "body_battery": body_battery,
+        "training_status": training_status,
+        "training_readiness": training_readiness,
+        "heart_rates": heart_rates,
+        "weigh_ins": weigh_ins,
+        "training_plans": training_plans,
+        "adaptive_plan_details": adaptive_plan_details,
+        "scheduled_workouts": scheduled_workouts,
+        "personal_records": personal_records,
+        "race_predictions": race_predictions,
+        "fetch_errors": errors,
+    }
+
+    out = Path(args.out).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, default=str, indent=2))
+    print(f"wrote {out} ({len(errors)} per-call errors)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

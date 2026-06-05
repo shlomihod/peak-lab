@@ -1,0 +1,20 @@
+{
+  "name": "peak-lab",
+  "version": "0.2.0",
+  "description": "Claude Code plugin that turns Garmin Connect data into a multi-agent training analysis. Port of leonzzz435/garmin-ai-coach.",
+  "author": {
+    "name": "shlomihod"
+  },
+  "repository": "https://github.com/shlomihod/peak-lab",
+  "license": "MIT",
+  "keywords": ["garmin", "training", "coaching", "fitness", "analysis", "running", "cycling"],
+  "userConfig": {
+    "analysis_window_days": {
+      "type": "number",
+      "title": "Analysis window (days)",
+      "description": "How many days of Garmin data to pull for each analyze run.",
+      "default": 60,
+      "sensitive": false
+    }
+  }
+}

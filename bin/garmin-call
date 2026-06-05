@@ -1,0 +1,374 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "garminconnect>=0.3.2",
+#     "curl_cffi>=0.6",
+# ]
+# ///
+"""
+garmin-call: call a single read-only Garmin Connect API method and print JSON.
+
+The security boundary for peak-lab's dynamic Garmin access. A frozenset
+whitelist of allowed READ methods is hardcoded at the top of this file and
+checked before any `getattr` is performed against the Garmin client.
+Destructive methods (delete, add, set, upload, import, create) are never
+in the whitelist and cannot be invoked through this dispatcher.
+
+Usage:
+    garmin-call --list                                        # print whitelist
+    garmin-call <method> [arg ...]                            # call, JSON to stdout
+    garmin-call <method> [arg ...] > runs/latest/detail.json  # capture via shell
+
+Examples:
+    garmin-call get_full_name
+    garmin-call get_stats YYYY-MM-DD
+    garmin-call get_activities_by_date YYYY-MM-DD YYYY-MM-DD
+    garmin-call get_activity <ACTIVITY_ID>
+
+Reads OAuth tokens from $GARMINTOKENS or ~/.garminconnect. Never prompts
+for credentials — run bin/garmin-auth first.
+
+JSON always goes to stdout; the caller's shell chooses the output path via
+standard redirect. This is deliberate: letting an adversarial caller choose
+the --out path is a whole class of path-traversal bugs that shell redirect
+avoids entirely. Every invocation appends one JSONL audit line to
+$(pwd)/garmin-call.log. peak-lab expects to be run from the training
+project directory — cd there first, no env vars.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+)
+
+# Scrub OAuth tokens / auth headers from exception strings before they land in
+# stderr or the audit log. garminconnect / curl_cffi sometimes embed full
+# request URLs and Authorization headers in their exception messages.
+_SECRET_RE = re.compile(
+    r"(?:Bearer\s+\S+|oauth_token=\S+|access_token=\S+|"
+    r"Authorization:\s*\S+|Cookie:\s*[^\s,]+|token=[^&\s]+)",
+    re.IGNORECASE,
+)
+
+
+def scrub_err(e: BaseException, limit: int = 120) -> str:
+    """Return a sanitized exception string safe for stderr/logs."""
+    return _SECRET_RE.sub("<REDACTED>", f"{type(e).__name__}: {e}")[:limit]
+
+# ---------------------------------------------------------------------------
+# Security boundary: the whitelist of allowed read-only methods.
+# Anything not in this set is rejected before getattr runs.
+# ---------------------------------------------------------------------------
+ALLOWED_METHODS: frozenset[str] = frozenset(
+    {
+        # Profile
+        "get_full_name",
+        "get_unit_system",
+        # Daily health
+        "get_stats",
+        "get_user_summary",
+        "get_steps_data",
+        "get_floors",
+        "get_daily_steps",
+        "get_weekly_steps",
+        "get_weekly_stress",
+        "get_weekly_intensity_minutes",
+        "get_intensity_minutes_data",
+        "get_heart_rates",
+        "get_rhr_day",
+        "get_stats_and_body",
+        # Physiology / recovery
+        "get_hrv_data",
+        "get_sleep_data",
+        "get_stress_data",
+        "get_all_day_stress",
+        "get_all_day_events",
+        "get_respiration_data",
+        "get_spo2_data",
+        "get_body_battery",
+        "get_body_battery_events",
+        "get_blood_pressure",
+        "get_hydration_data",
+        "get_lifestyle_logging_data",
+        # Body composition
+        "get_body_composition",
+        "get_weigh_ins",
+        "get_daily_weigh_ins",
+        # Training metrics
+        "get_training_readiness",
+        "get_morning_training_readiness",
+        "get_training_status",
+        "get_endurance_score",
+        "get_running_tolerance",
+        "get_race_predictions",
+        "get_personal_record",
+        "get_lactate_threshold",
+        "get_max_metrics",
+        "get_fitnessage_data",
+        "get_hill_score",
+        # Activities
+        "count_activities",
+        "get_activities",
+        "get_activities_fordate",
+        "get_last_activity",
+        "get_activities_by_date",
+        "get_progress_summary_between_dates",
+        "get_activity_types",
+        "get_activity",
+        "get_activity_details",
+        "get_activity_splits",
+        "get_activity_typed_splits",
+        "get_activity_split_summaries",
+        "get_activity_weather",
+        "get_activity_hr_in_timezones",
+        "get_activity_power_in_timezones",
+        "get_activity_exercise_sets",
+        "get_activity_gear",
+        "get_cycling_ftp",
+        # Goals
+        "get_goals",
+        # Training plans & workouts (Garmin Coach, scheduled sessions)
+        "get_training_plans",
+        "get_training_plan_by_id",
+        "get_adaptive_training_plan_by_id",
+        "get_workouts",
+        "get_workout_by_id",
+        "get_scheduled_workouts",
+        "get_scheduled_workout_by_id",
+        # Gear
+        "get_gear",
+        "get_gear_stats",
+        "get_gear_defaults",
+        "get_gear_activities",
+        # Devices
+        "get_devices",
+        "get_device_settings",
+        "get_primary_training_device",
+        "get_device_solar_data",
+        "get_device_alarms",
+        "get_device_last_used",
+    }
+)
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_NOT_ALLOWED = 2
+
+
+def tokenstore_path() -> str:
+    return str(Path(os.getenv("GARMINTOKENS", "~/.garminconnect")).expanduser())
+
+
+def audit_log_path() -> Path:
+    return Path.cwd() / "garmin-call.log"
+
+
+def audit(
+    method: str,
+    args: list[str],
+    exit_code: int,
+    bytes_out: int,
+    elapsed_ms: int,
+    note: str = "",
+) -> None:
+    """Append one JSONL line. Never writes response bodies, never writes token contents."""
+    try:
+        path = audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "method": method,
+            "arg_count": len(args),
+            "exit": exit_code,
+            "bytes": bytes_out,
+            "elapsed_ms": elapsed_ms,
+        }
+        if note:
+            entry["note"] = note
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        # Never let logging failure take down the call.
+        pass
+
+
+def print_list() -> int:
+    """Print the whitelist grouped, with one-line descriptions from docstrings."""
+    try:
+        from garminconnect import Garmin as GarminClass  # noqa: N813
+
+        descriptions: dict[str, str] = {}
+        for name in ALLOWED_METHODS:
+            meth = getattr(GarminClass, name, None)
+            doc = (getattr(meth, "__doc__", "") or "").strip().split("\n")[0]
+            descriptions[name] = doc[:90]
+    except Exception:
+        descriptions = {name: "" for name in ALLOWED_METHODS}
+
+    print(f"Allowed read-only Garmin methods ({len(ALLOWED_METHODS)}):\n")
+    for name in sorted(ALLOWED_METHODS):
+        desc = descriptions.get(name, "")
+        if desc:
+            print(f"  {name:40s}  {desc}")
+        else:
+            print(f"  {name}")
+    return EXIT_OK
+
+
+def login_or_die() -> Garmin:
+    path = tokenstore_path()
+    if not Path(path).exists():
+        print(
+            f"error: no Garmin tokens at {path}. Run bin/garmin-auth first.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_ERROR)
+    try:
+        api = Garmin()
+        api.login(path)
+        return api
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
+        print(
+            f"error: saved tokens invalid: {scrub_err(e)}\n"
+            "Re-run bin/garmin-auth --force to refresh.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_ERROR)
+
+
+def _coerce(v: str):
+    low = v.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low in ("none", "null"):
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def split_pos_and_kwargs(raw: list[str]) -> tuple[list, dict]:
+    """Split raw CLI args into positional + kwargs.
+
+    A token shaped `key=value` where `key` is a valid Python identifier
+    becomes a kwarg. Everything else stays positional. Values are coerced
+    from bool/int/float/None when unambiguous, otherwise stay as strings.
+    """
+    pos: list = []
+    kw: dict = {}
+    for tok in raw:
+        if "=" in tok:
+            key, _, val = tok.partition("=")
+            if key.isidentifier():
+                kw[key] = _coerce(val)
+                continue
+        pos.append(_coerce(tok))
+    return pos, kw
+
+
+def call_method(api: Garmin, method: str, args: list[str]):
+    fn = getattr(api, method)
+    pos, kw = split_pos_and_kwargs(args)
+    return fn(*pos, **kw)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Read-only Garmin Connect API dispatcher.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--list", action="store_true", help="print allowed methods and exit")
+    parser.add_argument("method", nargs="?", help="method name (must be whitelisted)")
+    parser.add_argument("args", nargs="*", help="positional args for the method (strings)")
+    ns = parser.parse_args()
+
+    if ns.list:
+        return print_list()
+
+    if not ns.method:
+        parser.print_usage(sys.stderr)
+        print("error: method required (or use --list)", file=sys.stderr)
+        return EXIT_ERROR
+
+    method = ns.method
+    args = list(ns.args)
+    start = time.monotonic()
+
+    # Security boundary: reject BEFORE any getattr
+    if method not in ALLOWED_METHODS:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        audit(method, args, EXIT_NOT_ALLOWED, 0, elapsed_ms, note="rejected_not_allowed")
+        print(
+            f"error: method {method!r} is not in the read-only whitelist.\n"
+            "Run `garmin-call --list` to see allowed methods.",
+            file=sys.stderr,
+        )
+        return EXIT_NOT_ALLOWED
+
+    api = login_or_die()
+
+    try:
+        result = call_method(api, method, args)
+    except TypeError as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        audit(method, args, EXIT_ERROR, 0, elapsed_ms, note="bad_args")
+        print(f"error: bad arguments for {method}: {scrub_err(e)}", file=sys.stderr)
+        return EXIT_ERROR
+    except GarminConnectAuthenticationError as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        audit(method, args, EXIT_ERROR, 0, elapsed_ms, note="auth_error")
+        print(f"error: auth error during {method}: {scrub_err(e)}", file=sys.stderr)
+        return EXIT_ERROR
+    except GarminConnectConnectionError as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        audit(method, args, EXIT_ERROR, 0, elapsed_ms, note="connection_error")
+        print(f"error: connection error during {method}: {scrub_err(e)}", file=sys.stderr)
+        return EXIT_ERROR
+    except Exception as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        audit(method, args, EXIT_ERROR, 0, elapsed_ms, note=type(e).__name__)
+        print(f"error: {method} raised {scrub_err(e)}", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        payload = json.dumps(result, default=str, indent=2)
+    except (TypeError, ValueError) as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        audit(method, args, EXIT_ERROR, 0, elapsed_ms, note="unserializable")
+        print(f"error: response from {method} is not JSON-serializable: {scrub_err(e)}", file=sys.stderr)
+        return EXIT_ERROR
+
+    bytes_out = len(payload.encode("utf-8"))
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+
+    sys.stdout.write(payload)
+    if not payload.endswith("\n"):
+        sys.stdout.write("\n")
+
+    audit(method, args, EXIT_OK, bytes_out, elapsed_ms)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
