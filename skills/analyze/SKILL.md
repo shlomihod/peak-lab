@@ -97,6 +97,18 @@ test -f data/lab-zones.json && \
 
 Skip this entirely when `data/lab-zones.json` is absent (the common case) — no lab-zones file means no chart, and the renderer simply omits the section. The 90-day fetch reuses the just-fetched `runs/latest/raw.json` as its `--prev`, so it is mostly incremental and fast. A non-zero exit here is non-fatal: the rest of the analysis still renders, just without the lab-zones chart.
 
+### Effort detail streams for the durability (power-duration) section
+
+Pull per-second detail streams for the athlete's hardest recent running efforts. The renderer in Phase 4 appends a **"Durability — pace you can hold vs how long"** section (a power-duration envelope plot of fastest pace held vs duration + best-effort table; no model is fit) whenever an `effort-details/` dir with detail files sits next to `analysis.json`. Run this right after the main fetch:
+
+```
+"${CLAUDE_PLUGIN_ROOT}/bin/fetch-effort-details" runs/<TS_VALUE>/raw.json \
+  --out runs/<TS_VALUE>/effort-details --prev runs/latest/effort-details \
+  || true
+```
+
+`bin/fetch-effort-details` selects a bounded set (~10) of candidate max efforts from `raw.json` (races + longest runs + hardest by heart rate + fastest by pace), fetches `get_activity_details` for each, and trims every stream to the few metrics the envelope needs (time + distance + heart rate) so cached files stay small. With `--prev` pointing at the previous run's `effort-details/` dir, already-fetched efforts are reused (copied) rather than refetched, so warm runs only hit the network for newly-surfaced efforts. A non-zero exit is non-fatal: the rest of the analysis still renders, just without the durability section. This runs for any running athlete — no project-local data file required (unlike the lab-zones chart). Note the `--prev` here points at a **directory** (`runs/latest/effort-details`), not a file.
+
 ## Phase 2: Dispatch three experts in parallel
 
 Use the Task tool with `subagent_type` values **`peak-lab:metrics-expert`**, **`peak-lab:activity-expert`**, **`peak-lab:physiology-expert`** — plugin-loaded subagents are always namespaced with their plugin name. **Dispatch all three in a single message with three tool calls** so they run concurrently.
@@ -304,6 +316,8 @@ Invoke the bundled renderer via Bash. Again, inline the literal `RUN_DIR` value 
 ```
 
 The renderer auto-discovers extras next to `analysis.json` — `raw.json` and `training-metrics.json` for the charts, and (when present) `data/lab-zones.json` + `raw-90d.json` to append the **HR/pace-vs-lab-zones** section before `</body>`. That section is regenerated on every render via the bundled `bin/hrpace-lab-section` (a uv/scipy script; this renderer stays stdlib-only), so any later re-render of the same HTML reproduces it automatically — callers don't need to re-inject it. No `data/lab-zones.json` → the section is silently omitted.
+
+It also auto-discovers an `effort-details/` dir next to `analysis.json` and, when present, appends the **Durability (power-duration)** section *after* the HR/pace scatter via the bundled `bin/durability-section` (stdlib-only). Like the scatter, it is regenerated on every render, so re-renders reproduce it with no re-injection. No `effort-details/` dir → the section is silently omitted.
 
 Then update the `latest` symlink — the next analyze run reads `runs/latest` for its incremental fetch and since-last-run delta:
 

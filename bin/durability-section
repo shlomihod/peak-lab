@@ -1,0 +1,328 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""Build the "Durability — pace you can hold vs how long" section and inject it
+into analysis.html.
+
+From the per-effort detail streams in a details dir (see fetch-effort-details),
+builds the mean-maximal-speed envelope (best pace sustained for each duration,
+across all efforts, GPS-spike resistant via rolling windows) and renders a
+pace-vs-duration plot (log time axis) plus a best-effort table. No model is
+fit — the plot is purely the fastest pace observed at each duration. Honest
+caveats are rendered in the note: the envelope is stitched across different
+days, the long end is usually a paced race (not a maximal hour), so the droop
+overstates a true durability deficit; a clean read needs a maximal ~30-min
+effort.
+
+Usage:
+  durability-section <details-dir> <raw.json> [--lab-zones F] [--out FRAG.html] [--inject ANALYSIS.html]
+
+Stdlib-only. Idempotent injection (replaces any prior copy of this section).
+"""
+import argparse, json, math, re, sys
+from pathlib import Path
+
+MON = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+# Durations (s) at which to sample the envelope. Sub-30s is dropped: it is
+# noise-dominated (single GPS samples) and irrelevant to endurance durability.
+DURS = [30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 900, 1200, 1800, 2400, 3600, 5400, 7200, 9000]
+# GPS-glitch ceiling: any inter-sample speed above (GLITCH_K x best 10-min
+# speed) is treated as a teleport, and windows spanning it are rejected. 1.6x
+# is generous enough to keep real sprints (a distance runner's 30s is well
+# under 1.6x their 10-min pace) while killing the 15-25 m/s cumulative-distance
+# jumps that pollute the short end. Fallback ceiling when no 10-min window
+# exists (all efforts shorter than that).
+GLITCH_K = 1.6
+GLITCH_FALLBACK_MS = 6.0   # ~2:46/km — above any plausible sustained sample for this use
+# Rows shown in the table (a readable subset).
+TABLE_DURS = [60, 300, 600, 1200, 1800, 3600, 5400, 7200]
+PALETTE = ['#3f007d', '#807dba', '#41ab5d', '#d94801', '#08519c', '#ce1256', '#6a51a3', '#238b45']
+
+OPEN_MARK = "<!-- BEGIN DURABILITY SECTION (project-local injection) -->"
+CLOSE_MARK = "<!-- END DURABILITY SECTION (project-local injection) -->"
+
+
+def fp(sec):
+    """Seconds/km -> 'm:ss'."""
+    m = int(sec // 60); s = int(round(sec - m * 60))
+    if s == 60:
+        m += 1; s = 0
+    return f"{m}:{s:02d}"
+
+
+def fdur(s):
+    """Seconds -> compact duration label."""
+    if s < 60:
+        return f"{int(s)}s"
+    if s < 3600:
+        m = s / 60
+        return f"{int(m)}m" if abs(m - round(m)) < 1e-6 else f"{m:.1f}m"
+    h = s / 3600
+    return f"{int(h)}h" if abs(h - round(h)) < 1e-6 else f"{h:.1f}h"
+
+
+def load_effort(path):
+    d = json.loads(Path(path).read_text())
+    idx = {m['key']: m['metricsIndex'] for m in d.get('metricDescriptors', [])}
+    if 'sumDuration' not in idx or 'sumDistance' not in idx:
+        return None
+    ti, di = idx['sumDuration'], idx['sumDistance']
+    T, D = [], []
+    for s in d.get('activityDetailMetrics', []):
+        m = s.get('metrics') or []
+        if ti >= len(m) or di >= len(m) or m[ti] is None or m[di] is None:
+            continue
+        T.append(float(m[ti])); D.append(float(m[di]))
+    if len(T) < 3:
+        return None
+    o = sorted(range(len(T)), key=lambda i: T[i])
+    return {'id': str(d.get('activityId')), 'T': [T[i] for i in o], 'D': [D[i] for i in o]}
+
+
+def best_speed(T, D, dur, gpref=None):
+    """Fastest average speed (m/s) over any window of length >= dur. Two-pointer.
+    If gpref (a prefix-count of glitch transitions) is given, windows that span
+    a glitched inter-sample segment are rejected."""
+    n = len(T); j = 0; best = 0.0; ok = False
+    for i in range(n):
+        if j < i:
+            j = i
+        while j < n and T[j] - T[i] < dur:
+            j += 1
+        if j >= n:
+            break
+        if gpref is not None and gpref[j] - gpref[i] > 0:
+            continue                       # window spans a GPS teleport
+        dt = T[j] - T[i]; dd = D[j] - D[i]
+        if dt > 0 and dd > 0:
+            best = max(best, dd / dt); ok = True
+    return best if ok else None
+
+
+def glitch_prefix(T, D, cap):
+    """Cumulative count of inter-sample segments whose implied speed exceeds
+    cap (m/s). gpref[k] = glitches strictly before sample k, so a window over
+    samples i..j contains gpref[j]-gpref[i] glitched segments."""
+    g = [0] * len(T)
+    run = 0
+    for k in range(len(T) - 1):
+        dt = T[k + 1] - T[k]
+        if dt > 0 and (D[k + 1] - D[k]) / dt > cap:
+            run += 1
+        g[k + 1] = run
+    return g
+
+
+def effort_labels(raw):
+    """activityId -> short factual label + sort date, from raw.json."""
+    out = {}
+    for a in raw.get('activities', []):
+        aid = a.get('activityId')
+        if not aid:
+            continue
+        date = str(a.get('startTimeLocal', ''))[:10]
+        dist = (a.get('distance') or 0) / 1000.0
+        race = (a.get('eventType', {}) or {}).get('typeKey') == 'race'
+        try:
+            lbl = f"{MON[int(date[5:7])]} {int(date[8:10])}"
+        except (ValueError, IndexError):
+            lbl = date
+        lbl += f" · {dist:.1f}k" + (" race" if race else "")
+        out[str(aid)] = {'label': lbl, 'date': date, 'race': race}
+    return out
+
+
+def build_section(details_dir, raw, lab):
+    efforts = [e for e in (load_effort(p) for p in sorted(Path(details_dir).glob('*.json'))) if e]
+    if not efforts:
+        return None
+    labels = effort_labels(raw)
+
+    # ---- GPS-glitch ceiling, self-calibrated from clean 10-min efforts ----
+    long_speeds = [s for s in (best_speed(e['T'], e['D'], 600) for e in efforts) if s]
+    cap = GLITCH_K * max(long_speeds) if long_speeds else GLITCH_FALLBACK_MS
+    for e in efforts:
+        e['g'] = glitch_prefix(e['T'], e['D'], cap)
+
+    # ---- envelope: best (glitch-filtered) speed per duration + which effort ----
+    env = []  # (dur, speed, src_id)
+    for dur in DURS:
+        best, who = None, None
+        for e in efforts:
+            if e['T'][-1] < dur * 0.9:
+                continue
+            s = best_speed(e['T'], e['D'], dur, e['g'])
+            if s and (best is None or s > best):
+                best, who = s, e['id']
+        if best:
+            env.append((dur, best, who))
+    if len(env) < 3:
+        return None
+
+    # source colours, ordered by date
+    src_ids = sorted({who for _, _, who in env}, key=lambda i: labels.get(i, {}).get('date', i))
+    SC = {sid: PALETTE[k % len(PALETTE)] for k, sid in enumerate(src_ids)}
+
+    # ---- geometry ----
+    durs = [d for d, _, _ in env]
+    paces = [1000.0 / s for _, s, _ in env]            # s/km
+    lx0, lx1 = math.log10(min(durs)), math.log10(max(durs))
+    pmin, pmax = min(paces) - 12, max(paces) + 12
+    L, T_, W, H = 70, 28, 780, 430
+    def X(d): return L + (math.log10(d) - lx0) / (lx1 - lx0) * W
+    def Y(p): return T_ + (p - pmin) / (pmax - pmin) * H
+
+    S = []
+    VBH = T_ + H + 92
+    S.append(f'<svg viewBox="0 0 {L+W+24} {VBH}" preserveAspectRatio="xMidYMid meet" '
+             f'xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,sans-serif">')
+    S.append(f'<rect width="{L+W+24}" height="{VBH}" fill="#fbfbfd"/>')
+    S.append(f'<rect x="{L}" y="{T_}" width="{W}" height="{H}" fill="#fff" stroke="#c4c7cd"/>')
+
+    # y gridlines / pace ticks every 15 s/km
+    p0 = int(math.ceil(pmin / 15) * 15)
+    for pp in range(p0, int(pmax) + 1, 15):
+        yy = Y(pp)
+        S.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{L+W}" y2="{yy:.1f}" stroke="#eee"/>')
+        S.append(f'<text x="{L-8}" y="{yy+4:.1f}" font-size="11" fill="#777" text-anchor="end">{fp(pp)}</text>')
+
+    # x gridlines / duration ticks at nice values within range
+    ticks = [10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200]
+    for tk in ticks:
+        if tk < min(durs) * 0.95 or tk > max(durs) * 1.05:
+            continue
+        xx = X(tk)
+        S.append(f'<line x1="{xx:.1f}" y1="{T_}" x2="{xx:.1f}" y2="{T_+H}" stroke="#f0f0f3"/>')
+        S.append(f'<text x="{xx:.1f}" y="{T_+H+16}" font-size="11" fill="#777" text-anchor="middle">{fdur(tk)}</text>')
+
+    # envelope polyline + points
+    epath = ' '.join(f'{"M" if i==0 else "L"}{X(d):.1f},{Y(1000.0/s):.1f}' for i, (d, s, _) in enumerate(env))
+    S.append(f'<path d="{epath}" fill="none" stroke="#333" stroke-width="1.6" opacity="0.55"/>')
+    for d, s, who in env:
+        cx, cy = X(d), Y(1000.0 / s)
+        S.append(f'<circle class="dur-pt" cx="{cx:.1f}" cy="{cy:.1f}" r="4.6" fill="{SC.get(who,"#666")}" '
+                 f'stroke="#fff" stroke-width="0.8" data-dur="{fdur(d)}" data-pace="{fp(1000.0/s)}" '
+                 f'data-src="{labels.get(who,{}).get("label",who)}"/>')
+
+    # axis titles
+    S.append(f'<text x="{L+W/2}" y="{T_+H+40}" font-size="12.5" fill="#333" text-anchor="middle" font-weight="600">duration held (log scale) &#8594; longer</text>')
+    S.append(f'<text x="18" y="{T_+H/2}" font-size="12.5" fill="#333" text-anchor="middle" font-weight="600" transform="rotate(-90 18 {T_+H/2})">pace (min/km) &#8593; faster</text>')
+
+    # legend (source efforts)
+    yL = T_ + H + 64
+    lx = L
+    for k, sid in enumerate(src_ids):
+        if lx > L + W - 120:
+            yL += 18; lx = L
+        S.append(f'<circle cx="{lx+5}" cy="{yL}" r="4.6" fill="{SC[sid]}" stroke="#fff" stroke-width="0.8"/>')
+        txt = labels.get(sid, {}).get('label', sid)
+        S.append(f'<text x="{lx+14}" y="{yL+4}" font-size="11" fill="#444">{txt}</text>')
+        lx += 16 + 7.0 * len(txt) + 18
+    S.append('</svg>')
+
+    # ---- table ----
+    by_dur = {d: (s, who) for d, s, who in env}
+    rows = ''
+    for d in TABLE_DURS:
+        if d not in by_dur:
+            continue
+        s, who = by_dur[d]
+        rows += (f"<tr><td>{fdur(d)}</td><td>{fp(1000.0/s)}/km</td>"
+                 f"<td>{labels.get(who,{}).get('label',who)}</td></tr>")
+    # durability descriptor: how much pace fades from a short reference (best
+    # ~5 min) out to the longest sustained effort — purely factual, no model.
+    fade_txt = ''
+    ref = next((s for d, s, _ in env if d == 300), None) or max(s for _, s, _ in env)
+    long_d, long_s, _ = max(env, key=lambda r: r[0])
+    gap = 1000.0 / long_s - 1000.0 / ref
+    if gap > 0:
+        fade_txt = (f" From your best ~5-min pace ({fp(1000.0/ref)}/km) out to your longest effort "
+                    f"({fdur(long_d)}, {fp(1000.0/long_s)}/km), pace fades about <b>{int(round(gap))} s/km</b>.")
+
+    n_eff = len(efforts)
+    sub = (f"Best pace sustained for each duration, across your {n_eff} hardest recent running efforts. "
+           f"Each point is the fastest window of that length found in any one effort.")
+
+    return f"""<section id="durability-section">
+<style>
+#durability-section{{max-width:1100px;margin:22px auto 6px;padding:0 1.25rem;box-sizing:border-box;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1d1d1f}}
+#durability-section h2{{font-size:19px;margin:0 0 4px}}
+#durability-section .dur-sub{{color:#666;font-size:13px;margin-bottom:12px}}
+#durability-section .dur-card{{background:#fff;border:1px solid #e7e7ec;border-radius:14px;padding:12px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+#durability-section .dur-card svg{{width:100%;height:auto;display:block}}
+#durability-section .dur-pt{{cursor:pointer}} #durability-section .dur-pt:hover{{stroke:#111;stroke-width:2}}
+#durability-section table.dur-tbl{{border-collapse:collapse;margin:10px 0 2px;font-size:12.5px}}
+#durability-section table.dur-tbl th,#durability-section table.dur-tbl td{{border:1px solid #e3e3ea;padding:4px 12px;text-align:left}}
+#durability-section table.dur-tbl th{{background:#f3f1f8;font-weight:600;color:#444}}
+#durability-section table.dur-tbl td:first-child{{font-weight:700}}
+#durability-section .dur-note{{font-size:13.5px;line-height:1.6;color:#333;margin-top:14px}}
+#durability-section .dur-caveat{{font-size:12.5px;line-height:1.55;color:#555;background:#fff8ec;border:1px solid #f3e3c0;border-radius:10px;padding:10px 12px;margin-top:12px}}
+#durability-tt{{position:fixed;pointer-events:none;background:#111;color:#fff;padding:6px 9px;border-radius:6px;font-size:12px;line-height:1.45;opacity:0;transition:opacity .08s;z-index:30;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.25)}}
+</style>
+<h2>Durability — pace you can hold vs how long</h2>
+<div class="dur-sub">{sub}</div>
+<div class="dur-card">{''.join(S)}</div>
+<div id="durability-tt"></div>
+<table class="dur-tbl"><tr><th>duration</th><th>best pace</th><th>set in</th></tr>{rows}</table>
+<div class="dur-note"><b>How to read this.</b> Each point is the fastest pace you've actually held for that duration; the line slows as duration grows. How gently it slopes is your durability — the flatter it stays, the better you hold pace as efforts get longer.{fade_txt}</div>
+<div class="dur-caveat"><b>Read this with caution.</b> The envelope is stitched across <i>different days and different efforts</i> — the short end comes from your fastest short runs, the long end usually from a race paced for the full distance, not an all-out hour. So the long-duration points understate what you could do in a maximal effort, and the apparent droop overstates a true durability deficit. Windows below 30&nbsp;s are dropped and GPS teleports are filtered out (impossible inter-sample speeds that would otherwise fake a fast short window), but the short end is still "fastest observed," not a maximal test. A clean read needs a <b>maximal ~30-minute time trial</b> paired with a short hard effort. Treat this as a hypothesis to test, not a verdict.</div>
+<script>
+(function(){{
+  var tt=document.getElementById('durability-tt');
+  document.querySelectorAll('#durability-section .dur-pt').forEach(function(el){{
+    el.addEventListener('mouseenter',function(){{var d=el.dataset;
+      tt.innerHTML='<b>'+d.dur+'</b> &middot; '+d.pace+'/km<br>set in '+d.src;tt.style.opacity=1;}});
+    el.addEventListener('mousemove',function(e){{var x=e.clientX+14,y=e.clientY+14;if(x>window.innerWidth-180)x=e.clientX-170;tt.style.left=x+'px';tt.style.top=y+'px';}});
+    el.addEventListener('mouseleave',function(){{tt.style.opacity=0;}});
+  }});
+}})();
+</script>
+</section>"""
+
+
+def inject(analysis_path, fragment):
+    doc = analysis_path.read_text()
+    doc = re.sub(re.escape(OPEN_MARK) + r".*?" + re.escape(CLOSE_MARK), "", doc, flags=re.DOTALL)
+    block = f"\n{OPEN_MARK}\n{fragment}\n{CLOSE_MARK}\n"
+    idx = doc.lower().rfind("</body>")
+    doc = (doc.rstrip() + block + "\n") if idx < 0 else (doc[:idx] + block + doc[idx:])
+    analysis_path.write_text(doc)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument('details_dir')
+    ap.add_argument('raw')
+    ap.add_argument('--lab-zones')
+    ap.add_argument('--out')
+    ap.add_argument('--inject')
+    args = ap.parse_args(argv)
+
+    raw = json.loads(Path(args.raw).read_text())
+    lab = None
+    if args.lab_zones and Path(args.lab_zones).exists():
+        lab = json.loads(Path(args.lab_zones).read_text())
+
+    fragment = build_section(args.details_dir, raw, lab)
+    if not fragment:
+        print("durability section skipped: no usable effort detail streams", file=sys.stderr)
+        return 0
+
+    if args.out:
+        Path(args.out).write_text(fragment)
+        print(f"wrote fragment {args.out}")
+    if args.inject:
+        p = Path(args.inject)
+        if not p.exists():
+            print(f"error: inject target not found: {p}", file=sys.stderr)
+            return 1
+        inject(p, fragment)
+        print(f"injected durability section into {p}")
+    if not args.out and not args.inject:
+        sys.stdout.write(fragment)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,213 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "garminconnect>=0.3.2",
+#     "curl_cffi>=0.6",
+# ]
+# ///
+"""
+fetch-effort-details: pull per-second detail streams for an athlete's hardest
+running efforts, so the durability (power-duration / Critical Speed) section
+can build a mean-maximal-speed envelope.
+
+Reads raw.json (the activity list), selects a small bounded set of candidate
+max efforts (races + the longest runs + the hardest by heart rate + the
+fastest by pace), fetches get_activity_details for each, trims each stream to
+the few metrics the envelope needs (time + distance + heart rate), and writes
+one <activityId>.json into --out.
+
+Caching: with --prev pointing at a previous details dir, ids that were already
+fetched are reused (copied) instead of refetched, so warm runs are fast and
+only newly-surfaced efforts hit the network. Selecting fewer efforts than are
+cached simply prunes the unselected ones from this run's dir.
+
+Usage:
+  fetch-effort-details <raw.json> --out <dir> [--prev <dir>] [--max N]
+
+Non-fatal by design: per-effort fetch failures are logged and skipped; the
+durability section builds from whatever streams are present.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+_SECRET_RE = re.compile(
+    r"(?:Bearer\s+\S+|oauth_token=\S+|access_token=\S+|"
+    r"Authorization:\s*\S+|Cookie:\s*[^\s,]+|token=[^&\s]+)",
+    re.IGNORECASE,
+)
+
+
+def scrub_err(e: BaseException, limit: int = 120) -> str:
+    return _SECRET_RE.sub("<REDACTED>", f"{type(e).__name__}: {e}")[:limit]
+
+
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+)
+
+# Only these metrics are needed to build the speed-duration envelope; trimming
+# to them keeps each cached file small (~3 series vs ~20).
+NEEDED = ["sumDuration", "sumDistance", "directHeartRate"]
+
+
+def tokenstore_path() -> str:
+    return str(Path(os.getenv("GARMINTOKENS", "~/.garminconnect")).expanduser())
+
+
+def login() -> Garmin:
+    path = tokenstore_path()
+    if not Path(path).exists():
+        print(f"error: no Garmin tokens at {path}. Run bin/garmin-auth first.", file=sys.stderr)
+        sys.exit(2)
+    try:
+        api = Garmin()
+        api.login(path)
+        return api
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
+        print(f"error: saved tokens invalid: {scrub_err(e)}", file=sys.stderr)
+        print("Re-run bin/garmin-auth --force to refresh.", file=sys.stderr)
+        sys.exit(2)
+
+
+def select_efforts(activities: list[dict], cap: int) -> list[dict]:
+    """Pick a bounded set of running efforts that, together, define the
+    speed-duration envelope: races, the longest runs (long end of the curve),
+    the hardest by heart rate (threshold/interval), and the fastest by pace
+    (short bursts). Returns lightweight dicts with id/date/dur/dist/hr/label."""
+    runs = []
+    for a in activities:
+        tk = (a.get("activityType", {}) or {}).get("typeKey", "")
+        if "running" not in tk:
+            continue
+        aid = a.get("activityId")
+        dur = a.get("duration") or a.get("movingDuration") or 0
+        dist = a.get("distance") or 0
+        if not aid or not dur or not dist:
+            continue
+        runs.append({
+            "id": str(aid),
+            "date": str(a.get("startTimeLocal", ""))[:10],
+            "dur": float(dur),
+            "dist": float(dist),
+            "hr": float(a.get("averageHR") or 0),
+            "speed": float(dist) / float(dur),
+            "race": (a.get("eventType", {}) or {}).get("typeKey") == "race",
+            "name": a.get("activityName", ""),
+        })
+    if not runs:
+        return []
+
+    picked: dict[str, dict] = {}
+
+    def add(seq, n):
+        for r in seq[:n]:
+            picked.setdefault(r["id"], r)
+
+    add([r for r in runs if r["race"]], len(runs))                 # all races
+    add(sorted(runs, key=lambda r: -r["dur"]), 3)                  # longest 3
+    add(sorted(runs, key=lambda r: -r["hr"]), 6)                   # hardest 6 by HR
+    add(sorted(runs, key=lambda r: -r["speed"]), 3)                # fastest 3 by pace
+
+    # Keep races + longest first if we have to truncate, then by intensity.
+    out = list(picked.values())
+    out.sort(key=lambda r: (not r["race"], -max(r["dur"] / 60.0, r["hr"])))
+    return out[:cap]
+
+
+def trim(detail: dict) -> dict:
+    """Reduce a full activity-details payload to {activityId, descriptors, rows}
+    carrying only the NEEDED metrics, re-indexed from 0."""
+    md = detail.get("metricDescriptors", []) or []
+    idx = {m["key"]: m["metricsIndex"] for m in md}
+    keep = [k for k in NEEDED if k in idx]
+    desc = [{"key": k, "metricsIndex": i} for i, k in enumerate(keep)]
+    rows = []
+    for s in detail.get("activityDetailMetrics", []) or []:
+        m = s.get("metrics") or []
+        try:
+            rows.append({"metrics": [m[idx[k]] for k in keep]})
+        except (IndexError, KeyError):
+            continue
+    return {
+        "activityId": detail.get("activityId"),
+        "metricDescriptors": desc,
+        "activityDetailMetrics": rows,
+    }
+
+
+def fetch_one(api: Garmin, aid: str) -> dict | None:
+    last = None
+    for args in ((aid, 2000, 0), (aid, 2000), (aid,)):
+        try:
+            return api.get_activity_details(*args)
+        except TypeError as e:
+            last = e
+            continue
+        except Exception as e:
+            raise e
+    if last:
+        raise last
+    return None
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(description="Fetch detail streams for an athlete's hardest running efforts")
+    ap.add_argument("raw", help="Path to raw.json")
+    ap.add_argument("--out", required=True, help="Output directory for <activityId>.json detail files")
+    ap.add_argument("--prev", default=None, help="Previous details dir to reuse cached files from")
+    ap.add_argument("--max", type=int, default=10, help="Max efforts to fetch (default 10)")
+    args = ap.parse_args(argv)
+
+    try:
+        raw = json.loads(Path(args.raw).read_text())
+    except Exception as e:
+        print(f"error: cannot read {args.raw}: {scrub_err(e)}", file=sys.stderr)
+        return 1
+
+    efforts = select_efforts(raw.get("activities", []) or [], args.max)
+    if not efforts:
+        print("no running efforts found; nothing to fetch")
+        return 0
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    prev = Path(args.prev) if args.prev else None
+
+    reused, fetched, failed = 0, 0, 0
+    api = None
+    for r in efforts:
+        dst = out / f"{r['id']}.json"
+        cached = prev / f"{r['id']}.json" if prev else None
+        if cached and cached.exists():
+            try:
+                dst.write_text(cached.read_text())
+                reused += 1
+                continue
+            except Exception:
+                pass  # fall through to refetch
+        if api is None:
+            api = login()
+        try:
+            detail = fetch_one(api, r["id"])
+            if not detail:
+                failed += 1
+                continue
+            dst.write_text(json.dumps(trim(detail)))
+            fetched += 1
+        except Exception as e:
+            print(f"  effort {r['id']} ({r['date']}): {scrub_err(e)}", file=sys.stderr)
+            failed += 1
+
+    print(f"effort details: {len(efforts)} selected ({fetched} fetched, {reused} reused, {failed} failed) -> {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

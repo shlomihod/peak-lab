@@ -2437,6 +2437,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--metrics", default=None, help="Optional path to training-metrics.json (auto-discovered next to analysis.json)")
     parser.add_argument("--lab-zones", default=None, help="Optional path to lab-zones.json; enables the HR/pace-vs-lab-zones section (auto-discovered at ./data/lab-zones.json)")
     parser.add_argument("--raw90", default=None, help="Optional path to a wider (e.g. 90-day) raw.json for the HR/pace section (auto-discovered as raw-90d.json next to analysis.json)")
+    parser.add_argument("--effort-details", default=None, help="Optional path to an effort-details dir; enables the durability (power-duration) section (auto-discovered as effort-details/ next to analysis.json)")
     args = parser.parse_args(argv[1:])
 
     src = Path(args.analysis)
@@ -2500,6 +2501,28 @@ def main(argv: list[str]) -> int:
         except Exception as e:
             print(f"warning: HR/pace-lab section skipped: {e}", file=sys.stderr)
 
+    # Optional: append the durability (power-duration / Critical Speed) section,
+    # injected AFTER the HR/pace section so it lands right below the scatter.
+    # Data-gated on an effort-details dir (default effort-details/ next to
+    # analysis.json), populated by bin/fetch-effort-details during analyze.
+    # Regenerated on every render; non-fatal.
+    effort_dir = Path(args.effort_details) if args.effort_details else (src.parent / "effort-details")
+    durability_script = Path(__file__).resolve().parent / "durability-section"
+    durability_added = False
+    if effort_dir.is_dir() and any(effort_dir.glob("*.json")) and durability_script.exists():
+        try:
+            cmd = [str(durability_script), str(effort_dir), str(args.raw or (src.parent / "raw.json"))]
+            if lab_zones_path.exists():
+                cmd += ["--lab-zones", str(lab_zones_path)]
+            cmd += ["--inject", str(dst)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0 and "injected" in (r.stdout + r.stderr):
+                durability_added = True
+            elif r.returncode != 0:
+                print(f"warning: durability section skipped: {r.stderr.strip()}", file=sys.stderr)
+        except Exception as e:
+            print(f"warning: durability section skipped: {e}", file=sys.stderr)
+
     size = dst.stat().st_size
     parts = []
     if raw_data:
@@ -2508,6 +2531,8 @@ def main(argv: list[str]) -> int:
         parts.append("metrics")
     if hrpace_added:
         parts.append("hr/pace-lab")
+    if durability_added:
+        parts.append("durability")
     extras = " with " + "+".join(parts) if parts else ""
     print(f"wrote {dst} ({size} bytes{extras})")
     return 0
