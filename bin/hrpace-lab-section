@@ -48,6 +48,23 @@ def halo(cx, cy, fill):
             f'<circle cx="{cx}" cy="{cy}" r="10" fill="none" stroke="#222" stroke-width="1.4"/>']
 
 
+def race_marker(cx, cy, fill):
+    """Checkered finish-flag square, centered on the datum = a race.
+    Distinct from circle/star/halo; still carries the month colour and
+    stays centred so the (pace, HR) position remains accurate."""
+    cs, n = 5.0, 3                                  # 3x3 checker -> 15px marker
+    x0, y0 = cx - n * cs / 2, cy - n * cs / 2
+    out = [f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{n*cs}" height="{n*cs}" fill="#fff"/>']
+    for i in range(n):
+        for j in range(n):
+            if (i + j) % 2 == 0:
+                out.append(f'<rect x="{x0+i*cs:.1f}" y="{y0+j*cs:.1f}" '
+                           f'width="{cs}" height="{cs}" fill="{fill}"/>')
+    out.append(f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{n*cs}" height="{n*cs}" '
+               f'fill="none" stroke="#222" stroke-width="1.4"/>')
+    return out
+
+
 def month_palette(keys):
     """keys: sorted list of 'YYYY-MM'. Light (oldest) -> dark (newest) purple, one shade each."""
     lo, hi = (203, 201, 226), (63, 0, 125)        # #cbc9e2 -> #3f007d
@@ -75,8 +92,10 @@ def extract_runs(raw, lab_test_date, z_hi):
             continue
         if 'track' in tk and hr >= z_hi:                   # exclude track QUALITY (keep easy track jogs)
             continue
+        is_race = (a.get('eventType', {}) or {}).get('typeKey') == 'race'
         runs.append({'date': date, 'mk': date[:7], 'km': dist,
-                     'p': (dur / dist) * 60, 'hr': float(hr), 'long': dur >= LONG_MIN})
+                     'p': (dur / dist) * 60, 'hr': float(hr),
+                     'long': dur >= LONG_MIN, 'race': is_race})
     runs.sort(key=lambda r: r['date'])
     return runs
 
@@ -107,7 +126,7 @@ def build_section(raw, lab):
 
     S = []
     VBH = T + H + 96
-    S.append(f'<svg viewBox="0 0 {L+W+30} {VBH}" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,sans-serif">')
+    S.append(f'<svg viewBox="0 0 {L+W+30} {VBH}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,sans-serif">')
     S.append(f'<rect width="{L+W+30}" height="{VBH}" fill="#fbfbfd"/>')
 
     # zone bands
@@ -143,7 +162,9 @@ def build_section(raw, lab):
     # run markers
     for r in runs:
         cx, cy, c = X(r['p']), Y(r['hr']), MC[r['mk']]
-        if r['long']:
+        if r['race']:
+            S.extend(race_marker(cx, cy, c))
+        elif r['long']:
             S.append(f'<polygon points="{star_pts(cx,cy,9.5)}" fill="{c}" stroke="#333" stroke-width="1"/>')
         elif r['date'] == latest:
             S.extend(halo(cx, cy, c))
@@ -174,7 +195,8 @@ def build_section(raw, lab):
     for r in runs:
         cx, cy = X(r['p']), Y(r['hr'])
         zone = lab['zones'][0]['key'] if r['hr'] < Z_LO else (lab['zones'][1]['key'] if r['hr'] <= Z_HI else lab['zones'][2]['key'])
-        typ = 'long run' if r['long'] else ('easy run (latest)' if r['date'] == latest else 'easy run')
+        typ = ('race' if r['race'] else 'long run' if r['long']
+               else 'easy run (latest)' if r['date'] == latest else 'easy run')
         S.append(f'<circle class="hrp-run" cx="{cx}" cy="{cy}" r="11" fill="transparent" '
                  f'data-date="{r["date"]}" data-km="{r["km"]:.1f}" data-pace="{fp(r["p"])}" '
                  f'data-hr="{r["hr"]:.0f}" data-zone="{zone}" data-type="{typ}"/>')
@@ -190,7 +212,10 @@ def build_section(raw, lab):
     tx = L + 370
     S.extend(halo(tx, yL, MC[mkeys[-1]]))
     S.append(f'<text x="{tx+15}" y="{yL+4}" font-size="11.5" fill="#333">latest run</text>')
-    gx, sw = L + 478, max(18, min(40, int(330 / max(1, len(mkeys)))))
+    rx = L + 478
+    S.extend(race_marker(rx, yL, MC[mkeys[-1]]))
+    S.append(f'<text x="{rx+13}" y="{yL+4}" font-size="11.5" fill="#333">race</text>')
+    gx, sw = L + 540, max(18, min(36, int(270 / max(1, len(mkeys)))))
     for i, mk in enumerate(mkeys):
         S.append(f'<rect x="{gx+i*sw}" y="{yL-7}" width="{sw}" height="11" fill="{MC[mk]}" stroke="#fff" stroke-width="0.6"/>')
         S.append(f'<text x="{gx+i*sw+sw/2}" y="{yL+15}" font-size="9" fill="#999" text-anchor="middle">{MON[int(mk[5:7])]}</text>')
@@ -221,10 +246,11 @@ def build_section(raw, lab):
 
     return f"""<section id="hrpace-lab-section">
 <style>
-#hrpace-lab-section{{margin:22px 0 6px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1d1d1f}}
+#hrpace-lab-section{{max-width:1100px;margin:22px auto 6px;padding:0 1.25rem;box-sizing:border-box;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1d1d1f}}
 #hrpace-lab-section h2{{font-size:19px;margin:0 0 4px}}
 #hrpace-lab-section .hrp-sub{{color:#666;font-size:13px;margin-bottom:12px}}
 #hrpace-lab-section .hrp-card{{background:#fff;border:1px solid #e7e7ec;border-radius:14px;padding:12px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+#hrpace-lab-section .hrp-card svg{{width:100%;height:auto;display:block}}
 #hrpace-lab-section .hrp-note{{font-size:13.5px;line-height:1.6;color:#333;margin-top:14px}}
 #hrpace-lab-section .hrp-pill{{display:inline-block;border-radius:20px;padding:3px 11px;font-size:12.5px;margin:2px 5px 2px 0;font-weight:600}}
 #hrpace-lab-section .hrp-p1{{background:#e3f3e8;color:#2c6e41}} #hrpace-lab-section .hrp-p2{{background:#fdf2d4;color:#9a730a}} #hrpace-lab-section .hrp-p3{{background:#fce1e1;color:#a5311f}}
@@ -241,7 +267,7 @@ def build_section(raw, lab):
 <div class="hrp-note">
 <div style="font-size:12px;color:#777;margin-bottom:4px">Zone tally counts <b>all {n_all} aerobic runs</b> (easy &#9679; + long ★ together):</div>
 {pills}
-<p style="margin-top:12px"><b>How to read this chart.</b> Each marker is one run, plotted by average pace (x) and average heart rate (y), coloured by month. &#9679; = easy/daily run, ★ = long run (&#8805;90 min), ◎ = latest run. The <b>grey line</b> is the lab test — the heart rate measured at each treadmill speed. The three shaded bands are the lab's training zones. The <b>dashed lines</b> are a robust per-month trend (Theil-Sen, easy runs only, drawn across each month's observed pace range).</p>
+<p style="margin-top:12px"><b>How to read this chart.</b> Each marker is one run, plotted by average pace (x) and average heart rate (y), coloured by month. &#9679; = easy/daily run, ★ = long run (&#8805;90 min), ◎ = latest run, &#127937; = race (checkered-flag marker). The <b>grey line</b> is the lab test — the heart rate measured at each treadmill speed. The three shaded bands are the lab's training zones. The <b>dashed lines</b> are a robust per-month trend (Theil-Sen, easy runs only, drawn across each month's observed pace range).</p>
 <p style="font-weight:600;margin:14px 0 2px">Per-month trend — easy runs only <span style="font-weight:400;color:#888">(long runs excluded; their cardiac drift would bias the pace↔HR fit)</span></p>
 {reg}
 <p style="font-size:12.5px;color:#666;margin-top:4px">Table columns — <b>“HR cost per 30 s/km faster”</b>: the trend line's steepness (beats of heart-rate rise per 30 s/km of faster pace), with its 95% confidence interval. <b>“Predicted HR @ {fp(REF)}/km”</b>: each month's trend at a fixed reference pace. <b>“vs lab line”</b>: that predicted HR minus the lab line at the same pace.</p>
